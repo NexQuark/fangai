@@ -30,6 +30,11 @@ This folder is the **single place** for vision, corrected assumptions, architect
 | [21-TESTING.md](./21-TESTING.md) | 🆕 Testing strategy — unit, integration, contract, E2E, CI pipeline |
 | [22-CLAW.md](./22-CLAW.md) | 🆕 Claw adapter — system ops muscle, whitelist, 3-layer defense |
 | [23-DATA-STRUCTURES.md](./23-DATA-STRUCTURES.md) | 🆕 Complete cross-organ types — Frame, Blood, Memory, INK, Pulse, Errors |
+| [24-EDGE-CASES.md](./24-EDGE-CASES.md) | 🆕 Seam 1 — orphan cascade, partial-refund flow, PACT reload race, dispatch reservation race |
+| [25-FAILURE-MODES.md](./25-FAILURE-MODES.md) | 🆕 Seam 2 — circuit breaker, disk-full degradation, key rotation, memory corruption, sense death |
+| [26-RECOVERY-PATTERNS.md](./26-RECOVERY-PATTERNS.md) | 🆕 Seam 3 — checkpoint replay, resume after `body.die`, orphan GC + harvest |
+| [27-SIPHON-GENERALIZED.md](./27-SIPHON-GENERALIZED.md) | 🆕 Seam 4 — unified extraction across Pi/Cursor/Claude/OpenCode/A2A, merge conflict policy, non-Cursor recap injection |
+| [28-SECURITY-MODEL.md](./28-SECURITY-MODEL.md) | 🆕 Seam 5 — trust bootstrap, identity binding, frame replay defense, side-channel surface, audit replay |
 | [adr/README.md](./adr/README.md) | Optional ADR template for irreversible choices |
 | [RISKS-AND-OPEN-QUESTIONS.md](./RISKS-AND-OPEN-QUESTIONS.md) | Decisions pending and failure modes |
 
