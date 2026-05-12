@@ -2,8 +2,8 @@
 
 > SEAM 5 of 5. Trust is bound at every edge: bootstrap, identity, frame replay, transport, and audit. Five threats, five mechanisms, no philosophy.
 
-**Status:** Draft · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
-**Depends on:** SPEC-14, SPEC-17, SPEC-18, SPEC-19, SPEC-23
+**Status:** Draft (Reconciled — Round 4) · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
+**Depends on:** SPEC-14, SPEC-17, SPEC-18, SPEC-19, SPEC-23 (canonical types: §23.6 `LineageHop` + §23.11 `LineageMac`, §23.13 `MuscleIdentity`/`SignedInk`, §23.17 `FounderKey`/`TrustBundle`/`AuditReport`/`ReplayResult`/`VerifyResult`, §23.18 `LedgerEncryptionConfig`, §23.19 error codes)
 
 ---
 
@@ -108,21 +108,7 @@ Each muscle kind has a transport-level identity that the body owns:
 | `host-tool` | hosting agent (Pi/Cursor) writes through a private pipe owned by the body's process; only the body's parent process can open it |
 | `claw` | in-process; identity is structural — code can only construct ClawMuscle with the body's internal handle |
 
-```ts
-// packages/body/src/muscles/identity.ts
-export interface MuscleIdentity {
-  muscleId: string;
-  bindingKind: 'pid' | 'mtls' | 'bearer' | 'pipe' | 'in-process';
-  bindingProof: {
-    pid?: number;
-    fingerprint?: string;            // mTLS cert sha256
-    tokenId?: string;                // bearer key id (NOT the token)
-    pipePath?: string;
-    inProcessHandle?: symbol;        // unforgeable in JS
-  };
-  boundAt: string;
-}
-```
+`MuscleIdentity`, `BindingKind`, `BindingProof`, and `TransportInbound` are defined canonically in **SPEC-23.13**.
 
 ### Registry binds at mount time
 
@@ -171,33 +157,11 @@ function authenticateFrame(frame: InkPayload, sender: MuscleHandle): void {
 
 ### Lineage HMAC chain
 
-Each hop, when adding to lineage, includes an HMAC over the previous hops using the agent's mount-time `bindingSecret` (derived from the body's master secret + agentId):
+Each hop, when adding to lineage, includes an HMAC over the previous hops using the agent's mount-time `bindingSecret` (derived from the body's master secret + agentId). The `LineageHop.mac` field is defined in **SPEC-23.6** (canonical) with the chain helpers (`computeLineageMac`, `verifyLineageMacChain`, `BindingSecretsTable`) defined in **SPEC-23.11**.
 
-```ts
-// lineage hop with mac
-interface LineageHop {
-  taskId: string;
-  agentId: string;
-  ts: string;
-  mac: string;            // hmac-sha256(prevLineage || taskId || agentId || ts, bindingSecret(agentId))
-}
-```
+`bindingSecret(agentId)` is held only by the body and embedded by the dispatcher when it hands a frame to a muscle (the muscle sees its secret as a sealed envelope; it cannot forge a hop attributed to a sibling).
 
-`bindingSecret(agentId)` is held only by the body and embedded by the dispatcher when it hands a frame to a muscle (the muscle sees its secret as a sealed envelope; it cannot forge a hop attributed to a sibling). Verification:
-
-```ts
-function verifyLineageMacChain(lineage: LineageHop[], secrets: SecretsTable): boolean {
-  let prev: LineageHop[] = [];
-  for (const hop of lineage) {
-    const expected = hmac(canonicalize([...prev, { ...hop, mac: undefined }]), secrets.get(hop.agentId));
-    if (!constantTimeEqual(expected, hop.mac)) return false;
-    prev.push(hop);
-  }
-  return true;
-}
-```
-
-A tampered or fabricated hop fails because the attacker doesn't know the bindingSecret. The body's master secret is generated at `fang init` and stored encrypted at `.fang/secrets.enc` (sealed with the operator's public key; only decrypted in memory at boot). For minimal-trust bodies, the secret is derived from machine identity + repoHash (less secure; documented).
+A tampered or fabricated hop fails verification because the attacker doesn't know the bindingSecret. The body's master secret is generated at `fang init` and stored encrypted at `.fang/secrets.enc` (sealed with the operator's public key; only decrypted in memory at boot). For minimal-trust bodies, the secret is derived from machine identity + repoHash (less secure; documented).
 
 ---
 
@@ -250,13 +214,7 @@ Run **after** the in-memory guard. Together they form a window that exceeds typi
 
 ### Signed body HMAC
 
-```ts
-interface SignedInk {
-  payload: InkPayload;
-  signedAt: string;          // body's stamp
-  hmac: string;              // hmac-sha256(canonicalize(payload || signedAt), bindingSecret(sender))
-}
-```
+`SignedInk` is defined canonically in **SPEC-23.13**.
 
 All host-tool and http transports carry `SignedInk`, not raw `InkPayload`. The dispatcher verifies HMAC + checks `signedAt` window + checks correlationId — **before** SoulPump.
 
@@ -337,14 +295,7 @@ Listening on `0.0.0.0` is **rejected at boot** unless TLS + mTLS + auth keys are
 
 ### Ledger at rest
 
-```ts
-interface LedgerEncryptionConfig {
-  enabled: boolean;
-  algorithm: 'aes-256-gcm';
-  keyDerivation: 'argon2id' | 'kdf-from-operator-pubkey';
-  segmentBytes: number;          // 64KB segments → seekable
-}
-```
+`LedgerEncryptionConfig` is defined canonically in **SPEC-23.18**.
 
 When enabled, each JSONL line is preceded by an AES-GCM tag and the file is read/written via a streaming layer (`packages/body/src/blood/encrypted-jsonl.ts`). Performance cost: ~5–10% on a typical workload. Off by default; on by recommendation for shared machines.
 
@@ -405,23 +356,11 @@ CI enforces: a test fires a known three-agent task; the audit replay should prod
 
 ### Tool: `fang audit replay <rootTaskId>`
 
+`AuditReport`, `AuditEvent`, `LineageTreeNode`, `BudgetFlow`, `BudgetFlowEdge`, `AuditViolation`, `DecisionTreeNode`, `ReplayResult`, and `VerifyResult` are defined canonically in **SPEC-23.17**.
+
 ```ts
-// packages/body/src/audit/replay.ts
-export interface AuditReport {
-  rootTaskId: string;
-  generatedAt: string;
-  timeline: AuditEvent[];
-  tree: LineageTreeNode;
-  budgetFlow: BudgetFlow;
-  violations: AuditViolation[];
-  decisionTree: DecisionTreeNode;     // why each routing happened
-  meta: {
-    totalDurationMs: number;
-    totalCost: { tokens: number; usd: number };
-    agentsInvolved: string[];
-    pactVersions: number[];
-  };
-}
+// packages/body/src/audit/replay.ts — implementation only; types live in SPEC-23.17
+import type { AuditReport } from '@fangai/body/types';
 
 export class AuditTool {
   constructor(private ledger: BloodLedger, private pactStore: PactStore) {}
@@ -537,36 +476,20 @@ expect(report.budgetFlow.edges).toMatchObject([
 
 ### Audit's own integrity
 
-Audit reads from ledger; ledger is append-only. Audit cannot mutate ledger. Audit reports embed a `coverageHash` over the lines they read; a downstream verifier can re-hash and confirm no tampering between report generation and consumption.
+Audit reads from ledger; ledger is append-only. Audit cannot mutate ledger. Audit reports embed a `coverageHash` over the lines they read (see `AuditReport.coverageHash`/`ledgerFiles[]` in **SPEC-23.17**); a downstream verifier can re-hash and confirm no tampering between report generation and consumption.
 
-```ts
-interface AuditReport {
-  ...
-  coverageHash: string;       // sha256 of canonicalized read window
-  ledgerFiles: Array<{ path: string; sha256: string; rangeStart: number; rangeEnd: number }>;
-}
-```
-
-A second tool, `fang audit verify`, takes a report + the present ledger and validates that everything still hashes the same.
+A second tool, `fang audit verify`, takes a report + the present ledger and validates that everything still hashes the same. It returns a `VerifyResult` (also in §23.17).
 
 ---
 
 ## 28.6 Security Error Codes & Pulses (Additions)
 
-```ts
-export type SecurityErrorCode =
-  | 'BOOT_NO_PACT' | 'BOOT_INSECURE_HTTP'
-  | 'MUSCLE_IDENTITY_REJECTED' | 'MUSCLE_IDENTITY_UNKNOWN'
-  | 'INK_AGENT_SPOOFED' | 'INK_LINEAGE_FORGED'
-  | 'INK_REPLAY_STALE' | 'INK_HMAC_INVALID'
-  | 'AUDIT_COVERAGE_MISMATCH';
+> Canonicalised in **SPEC-23.19** (`SecurityErrorCode`, `MuscleErrorCodeExt`, `InkErrorCodeExt`, `PulseKindExt`). Listed here for spec-local readability.
 
-// PulseKind additions
-| 'muscle.bound' | 'muscle.identity-rejected'
-| 'ink.replay-blocked' | 'ink.hmac-mismatch'
-| 'pact.key.rotating' | 'pact.bundle.updated' | 'pact.bundle.invalid'
-| 'audit.replay-built' | 'audit.coverage-mismatch';
-```
+- **`SecurityErrorCode`:** `BOOT_NO_PACT`, `BOOT_INSECURE_HTTP`, `AUDIT_COVERAGE_MISMATCH`
+- **`MuscleErrorCode` adds:** `MUSCLE_IDENTITY_REJECTED`, `MUSCLE_IDENTITY_UNKNOWN`
+- **`InkErrorCode` adds:** `INK_AGENT_SPOOFED`, `INK_LINEAGE_FORGED` (already in §23.10), `INK_REPLAY_STALE`, `INK_HMAC_INVALID`
+- **`PulseKind` adds:** `muscle.bound`, `muscle.identity-rejected`, `ink.replay-blocked`, `ink.hmac-mismatch`, `pact.key.rotating`, `pact.bundle.updated`, `pact.bundle.invalid`, `audit.replay-built`, `audit.coverage-mismatch`
 
 ---
 

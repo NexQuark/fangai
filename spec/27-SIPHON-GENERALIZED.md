@@ -2,8 +2,8 @@
 
 > SEAM 4 of 5. Cursor's 110/110 cold-recap was agent-specific. SIPHON is the same idea, normalized: one extraction pipeline, many session formats, one memory store.
 
-**Status:** Draft · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
-**Depends on:** SPEC-19, SPEC-23, SPEC-25, SPEC-26
+**Status:** Draft (Reconciled — Round 4) · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
+**Depends on:** SPEC-19, SPEC-23, SPEC-25, SPEC-26 (canonical types: §23.3 `MemoryRecord`, §23.15 `SessionSource`/`NormalizedEvent`/`SessionParser`/`Distiller*`/`RecapShape`/`RecapCapability`/`RecapRequest`/`RecapDocument`/`MemoryConflict`/`MemoryMergeReport`, §23.19 error codes)
 
 ---
 
@@ -40,66 +40,18 @@ Three stages, three contracts. The shared schema is `NormalizedEvent`. The share
 
 ### Source description
 
-```ts
-// packages/body/src/memory/siphon/source.ts
-export interface SessionSource {
-  sessionId: string;
-  agentId: string;
-  repoHash: string;
-  format: 'pi-jsonl' | 'cursor-transcript' | 'claude-stream-json'
-        | 'opencode-events' | 'a2a-frames' | 'unknown';
-  rootTaskId?: string;
-  startedAt: string;
-  endedAt?: string;
-  stream(): AsyncIterable<Buffer>;     // raw bytes
-}
-```
-
-A source describes only metadata + a stream. Sources come from three places:
+`SessionSource` and `SessionFormat` are defined canonically in **SPEC-23.15**. A source describes only metadata + a stream. Sources come from three places:
 - The body's session recorder (`packages/body/src/skin/session-recorder.ts`) writes raw transcripts under `.fang/sessions/<agentId>/<sessionId>.jsonl`.
 - Adapters call `siphon.record(stream, meta)` while serving requests.
 - Operators can replay external sessions: `fang siphon ingest --format pi-jsonl path/to/session.jsonl`.
 
 ### Normalized event schema (the lossless contract)
 
-```ts
-// packages/body/src/memory/siphon/normalized.ts
-export type NormalizedEventKind =
-  | 'user-prompt' | 'agent-thought' | 'agent-reply'
-  | 'tool-call' | 'tool-result'
-  | 'file-edit' | 'file-create' | 'file-delete'
-  | 'command-run' | 'commit'
-  | 'dispatch-out' | 'dispatch-in' | 'dispatch-result'
-  | 'error';
-
-export interface NormalizedEvent {
-  ts: string;
-  agentId: string;
-  sessionId: string;
-  kind: NormalizedEventKind;
-  text?: string;                   // human-readable summary
-  payload?: unknown;               // kind-specific blob, untyped
-  refs?: {
-    files?: string[];              // relative to repo root
-    commits?: string[];            // sha
-    correlationId?: string;        // INK linkage
-    taskId?: string;
-  };
-}
-```
-
-Every parser produces this stream. The downstream cares only about kind + refs + text.
+`NormalizedEvent` and `NormalizedEventKind` are defined canonically in **SPEC-23.15**. Every parser produces this stream. The downstream cares only about kind + refs + text.
 
 ### Parser interface
 
-```ts
-// packages/body/src/memory/siphon/parser.ts
-export interface SessionParser {
-  readonly format: SessionSource['format'];
-  match(src: SessionSource, peek?: Buffer): boolean;
-  parse(src: SessionSource): AsyncIterable<NormalizedEvent>;
-}
-```
+`SessionParser` is defined canonically in **SPEC-23.15**.
 
 ### Built-in parsers
 
@@ -153,29 +105,7 @@ Local Ollama (Qwen 2.5 0.5B / Phi-3.5-mini / `llama3.2:1b`) is sufficient. The d
 
 ### Distiller contract
 
-```ts
-// packages/body/src/memory/siphon/distiller.ts
-export interface DistillerInput {
-  events: NormalizedEvent[];
-  agentId: string;
-  repoHash: string;
-  sessionId: string;
-  windowStartTs: string;
-  windowEndTs: string;
-  priorMemoryDigest?: string;       // truncated existing memory; helps avoid dups
-}
-
-export interface DistillerOutput {
-  records: MemoryRecord[];
-  tokensIn: number;
-  tokensOut: number;
-  durationMs: number;
-}
-
-export interface Distiller {
-  call(input: DistillerInput): Promise<DistillerOutput>;
-}
-```
+`DistillerInput`, `DistillerOutput`, and `Distiller` are defined canonically in **SPEC-23.15**.
 
 ### Prompt skeleton
 
@@ -335,17 +265,7 @@ t=2s    memory.conflict          { fromAgent: cursor, toAgent: pi, subject: 'fan
 
 ### Adapter `recapShape`
 
-```ts
-// extension of MuscleConfig
-export type RecapShape = 'native' | 'system-message' | 'tool-system' | 'metadata' | 'inline-prefix' | 'none';
-
-export interface RecapCapability {
-  shape: RecapShape;
-  maxTokens?: number;            // adapter-specific upper bound
-  tokenizer?: 'gpt' | 'claude' | 'pi' | 'simple';
-  injectionPoint: 'first-message' | 'every-message' | 'session-start';
-}
-```
+`RecapShape` and `RecapCapability` are defined canonically in **SPEC-23.15** and added to `MuscleConfig` (§23.4) as an optional `recap?: RecapCapability` field.
 
 | Agent | `shape` | injection point |
 |-------|---------|-----------------|
@@ -384,22 +304,11 @@ Top-N until total tokens ≥ target. Per-kind reserves enforce a floor (e.g., at
 
 ### The renderer
 
+`RecapRequest` and `RecapDocument` are defined canonically in **SPEC-23.15**.
+
 ```ts
 // packages/body/src/memory/recap/render.ts
-export interface RecapRequest {
-  agentId: string;
-  intent: string;
-  repoHash: string;
-  contextWindowTokens: number;
-  tokenizer: RecapCapability['tokenizer'];
-}
-
-export interface RecapDocument {
-  format: 'markdown' | 'json';
-  body: string;
-  tokensEstimated: number;
-  recordIds: string[];           // for audit
-}
+import type { RecapRequest, RecapDocument } from '@fangai/body/types';
 
 export class RecapRenderer {
   async render(req: RecapRequest): Promise<RecapDocument>;
@@ -516,18 +425,9 @@ Cross-format equivalence: the same logical session expressed in two formats (Pi-
 
 ## 27.7 SIPHON Error Codes & Pulses (Additions)
 
-```ts
-// extends SiphonErrorCode
-| 'SIPHON_FORMAT_UNKNOWN'
-| 'SIPHON_DISTILLER_TIMEOUT'
-| 'SIPHON_MERGE_DEADLOCK'
-| 'SIPHON_RECAP_OVER_BUDGET';
+> Canonicalised in **SPEC-23.19** (`SiphonErrorCodeExt`, `PulseKindExt`). Listed here for spec-local readability.
 
-// PulseKind additions
-| 'siphon.session-opened' | 'siphon.session-closed'
-| 'siphon.window-distilled' | 'siphon.distill-failed'
-| 'memory.conflict' | 'memory.merged'
-| 'recap.requested' | 'recap.rendered' | 'recap.applied' | 'recap.skipped';
-```
+- **`SiphonErrorCode` adds:** `SIPHON_FORMAT_UNKNOWN`, `SIPHON_DISTILLER_TIMEOUT`, `SIPHON_MERGE_DEADLOCK`, `SIPHON_RECAP_OVER_BUDGET`
+- **`PulseKind` adds:** `siphon.session-opened`, `siphon.session-closed`, `siphon.window-distilled`, `siphon.distill-failed`, `memory.conflict`, `memory.merged`, `recap.requested`, `recap.rendered`, `recap.applied`, `recap.skipped`
 
 🐙

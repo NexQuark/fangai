@@ -2,8 +2,8 @@
 
 > SEAM 1 of 5. Four hostile shapes the dispatch graph can twist into. Each has a protocol, a pulse sequence, and a refund contract.
 
-**Status:** Draft · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
-**Depends on:** SPEC-17, SPEC-18, SPEC-19, SPEC-23
+**Status:** Draft (Reconciled — Round 4) · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
+**Depends on:** SPEC-17, SPEC-18, SPEC-19, SPEC-23 (canonical types: §23.12 `TaskEnvelope`/`Reservation`, §23.14 `OrphanPolicy`, §23.19 error codes)
 
 ---
 
@@ -91,14 +91,7 @@ t+~     task.failed          { taskId: 'T-002', code: 'TASK_ORPHANED' }
 
 ### Harvest policy
 
-```ts
-interface OrphanPolicy {
-  onOrphan: 'cancel' | 'harvest';      // default 'cancel'
-  harvestMaxDurationMs?: number;        // wait at most N ms; then cancel
-}
-```
-
-Default is `cancel` to bound resource burn. `harvest` is opt-in per dispatch (set on `meta.labels['orphan.policy']='harvest'`) and capped by PACT (`pact.rules.recursion.harvestMaxDurationMs`, default 60s).
+`OrphanPolicy` is defined canonically in **SPEC-23.14**. Default is `cancel` to bound resource burn. `harvest` is opt-in per dispatch (set on `meta.labels['orphan.policy']='harvest'`) and capped by PACT (`pact.rules.recursion.harvestMaxDurationMs`, default 60s).
 
 Harvested results are written to ledger as:
 
@@ -228,10 +221,10 @@ If v4 tightens `budgets.perAgent.cursor.tokensPerHour`, and F1 was Cursor's chil
 
 ### Version-pinning protocol
 
-Every frame, on evaluation, is stamped with the PACT it was evaluated against. The stamp lives **in the task envelope**, not in the wire frame.
+Every frame, on evaluation, is stamped with the PACT it was evaluated against. The stamp lives **in the task envelope**, not in the wire frame. `TaskEnvelope`, `PactPin`, `Reservation`, and `ReserveRequest` are all defined canonically in **SPEC-23.12**.
 
 ```ts
-// In TaskPump.acceptFrame
+// In TaskPump.acceptFrame — uses TaskEnvelope from SPEC-23.12
 const decision = soul.evaluate(frame, soul.activePact, ctx);
 if (!decision.ok) throw new PactViolation(decision.violation);
 const env: TaskEnvelope = {
@@ -311,27 +304,18 @@ A pure `evaluate(frame, pact, ctx)` reads `ctx.ledger.windowSpend(agent)` which 
 
 ### Solution — reservation table is the truth
 
-`BudgetReservation` is a sibling of the ledger. SoulPump consults it on every evaluation, and the act of evaluation is atomic-reserve-or-reject.
+`BudgetReservation` is a sibling of the ledger. SoulPump consults it on every evaluation, and the act of evaluation is atomic-reserve-or-reject. `Reservation`, `ReserveRequest`, and `ReserveResult` are defined canonically in **SPEC-23.12**.
 
 ```ts
-// packages/body/src/blood/budget-reservation.ts
-export interface Reservation {
-  id: string;
-  rootTaskId: string;
-  taskId: string;
-  agentId: string;
-  granted: BudgetRequest;
-  parentReservationId?: string;
-  state: 'active' | 'released' | 'refunded';
-  createdAt: string;
-}
+// packages/body/src/blood/budget-reservation.ts — implementation only; types live in SPEC-23.12
+import type { Reservation, ReserveRequest, ReserveResult } from '@fangai/body/types';
 
 export class BudgetReservation {
   private byAgent = new Map<string, Set<string>>();   // agentId → reservationIds
   private byRoot  = new Map<string, Set<string>>();   // rootTaskId → reservationIds
   private locks   = new Map<string, Mutex>();          // agentId → mutex
 
-  async tryReserve(req: ReserveRequest): Promise<Reservation | ReserveDenied> {
+  async tryReserve(req: ReserveRequest): Promise<ReserveResult> {
     const mu = this.lockFor(req.agentId);
     return mu.runExclusive(() => {
       const current = this.activeFor(req.agentId);
@@ -418,19 +402,10 @@ Fixtures: `packages/body/fixtures/edge/*.jsonl` capture the exact ledger sequenc
 
 ## 24.6 Error Code Additions
 
-```ts
-// extends MuscleErrorCode
-| 'TASK_ORPHANED'
+> Canonicalised in **SPEC-23.19** (`MuscleErrorCodeExt`, `InkErrorCodeExt`, `PulseKindExt`). Listed here for spec-local readability.
 
-// extends InkErrorCode
-| 'INK_RESERVATION_DENIED'
-| 'INK_FANOUT_RESERVATION_FAILED'
-
-// extends PulseKind
-| 'task.orphaned' | 'task.cancelling' | 'task.harvesting'
-| 'ink.harvested'
-| 'pact.detected' | 'pact.verifying' | 'pact.swapped' | 'pact.pin-released'
-| 'budget.reserved' | 'budget.denied' | 'budget.refunded'
-```
+- **`MuscleErrorCode` adds:** `TASK_ORPHANED`
+- **`InkErrorCode` adds:** `INK_RESERVATION_DENIED`, `INK_FANOUT_RESERVATION_FAILED`
+- **`PulseKind` adds:** `task.orphaned`, `task.cancelling`, `task.harvesting`, `ink.harvested`, `pact.detected`, `pact.verifying`, `pact.swapped`, `pact.pin-released`, `budget.reserved`, `budget.denied`, `budget.refunded`
 
 🐙

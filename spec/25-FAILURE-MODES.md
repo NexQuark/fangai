@@ -2,8 +2,8 @@
 
 > SEAM 2 of 5. The body limps; it does not crash. Five hostile shapes the substrate can take, and the exact pulse + state machine that survives each.
 
-**Status:** Draft · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
-**Depends on:** SPEC-18, SPEC-19, SPEC-23, SPEC-24
+**Status:** Draft (Reconciled — Round 4) · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
+**Depends on:** SPEC-18, SPEC-19, SPEC-23, SPEC-24 (canonical types: §23.16 `BreakerConfig`/`BreakerState`/`DiskFullPolicy`, §23.17 `TrustBundle`/`OperatorKeyEntry`, §23.18 `HealthReport`/`LedgerEncryptionConfig`, §23.19 error codes)
 
 ---
 
@@ -11,16 +11,11 @@
 
 ### Detection windows
 
+`BreakerConfig` and `BreakerState` are defined canonically in **SPEC-23.16**. The class implementation:
+
 ```ts
 // packages/body/src/muscles/circuit-breaker.ts
-export interface BreakerConfig {
-  failureThreshold: number;       // default 3
-  failureWindowMs: number;        // default 60_000
-  cooldownMs: number;             // default 120_000
-  halfOpenProbeBudget: number;    // default 1 successful probe to close
-}
-
-export type BreakerState = 'closed' | 'open' | 'half-open';
+import type { BreakerConfig, BreakerState } from '@fangai/body/types';
 
 export class CircuitBreaker {
   private state: BreakerState = 'closed';
@@ -488,25 +483,7 @@ t=620s  sense.migrated         { from: github, to: github-mirror, toolsCovered: 
 
 ## 25.6 Cross-Cutting: Health Aggregation
 
-`/health` becomes the body's vital-sign report:
-
-```ts
-interface HealthReport {
-  status: 'ok' | 'degraded' | 'critical';
-  ready: boolean;
-  repoHash: string;
-  pact: { version: number; sha: string; expiresAt?: string };
-  muscles: Array<{ id: string; state: 'up'|'degraded'|'open'|'half-open'|'down';
-                   breaker?: BreakerState; lastError?: string; fitness?: number }>;
-  senses:  Array<{ id: string; state: 'up'|'restarting'|'dead'|'migrated';
-                   restartAttempts?: number; }>;
-  blood:   { state: 'ok'|'rotating'|'degraded'|'recovering';
-             ringDepth?: number; lostEntries?: number };
-  memory:  { state: 'healthy'|'rebuilding'|'unavailable';
-             rebuildingSections?: string[] };
-  budget:  { rootInFlight: number; perAgent: Record<string, { reserved: number; spent: number; cap: number }> };
-}
-```
+`/health` becomes the body's vital-sign report. The `HealthReport` shape is defined canonically in **SPEC-23.18**.
 
 `status === 'degraded'` if **any** subsystem is non-`ok` but the body still accepts new tasks. `'critical'` if PACT is invalid or repoHash mismatch (post-boot drift detected).
 
@@ -514,19 +491,13 @@ interface HealthReport {
 
 ## 25.7 Failure-Mode Error Codes (Additions)
 
-```ts
-export type LedgerErrorCode  = 'LEDGER_DISK_FULL' | 'LEDGER_RO_FS' | 'LEDGER_IO' | 'LEDGER_DEGRADED';
-export type SenseErrorCode   = 'SENSE_DEAD' | 'SENSE_DIED_MID_CALL' | 'SENSE_RESTART_EXHAUSTED' | 'SENSE_MIGRATED';
-export type MemoryErrorCode  = 'MEMORY_CORRUPT' | 'MEMORY_UNAVAILABLE' | 'MEMORY_REBUILDING';
-export type PactKeyErrorCode = 'PACT_KEY_EXPIRED' | 'PACT_BUNDLE_INVALID' | 'PACT_NO_TRUSTED_KEY';
+> Canonicalised in **SPEC-23.19**. Listed here for spec-local readability.
 
-// PulseKind additions
-| 'muscle.probing' | 'muscle.recovered'
-| 'ledger.full' | 'ledger.degraded' | 'ledger.recovering' | 'ledger.recovered'
-| 'pact.key.rotating' | 'pact.key.expired' | 'pact.bundle.updated'
-| 'memory.corrupt' | 'memory.rebuilding' | 'memory.rebuilt' | 'memory.unavailable'
-| 'sense.unhealthy' | 'sense.restarting' | 'sense.dead' | 'sense.migrated'
-```
+- **`LedgerErrorCode`:** `LEDGER_DISK_FULL`, `LEDGER_RO_FS`, `LEDGER_IO`, `LEDGER_DEGRADED`
+- **`SenseErrorCode`:** `SENSE_DEAD`, `SENSE_DIED_MID_CALL`, `SENSE_RESTART_EXHAUSTED`, `SENSE_MIGRATED`
+- **`MemoryErrorCode`:** `MEMORY_CORRUPT`, `MEMORY_UNAVAILABLE`, `MEMORY_REBUILDING`
+- **`PactKeyErrorCode`:** `PACT_KEY_EXPIRED`, `PACT_BUNDLE_INVALID`, `PACT_NO_TRUSTED_KEY`
+- **`PulseKind` adds:** `muscle.probing`, `muscle.recovered`, `ledger.full`, `ledger.degraded`, `ledger.recovering`, `ledger.recovered`, `pact.key.rotating`, `pact.key.expired`, `pact.bundle.updated`, `memory.corrupt`, `memory.rebuilding`, `memory.rebuilt`, `memory.unavailable`, `sense.unhealthy`, `sense.restarting`, `sense.dead`, `sense.migrated`
 
 ---
 

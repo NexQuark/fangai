@@ -29,12 +29,13 @@ This folder is the **single place** for vision, corrected assumptions, architect
 | [20-PHASE-0-PLAN.md](./20-PHASE-0-PLAN.md) | 🆕 Phase 0 migration — day-by-day plan, 5 days, 5 commits |
 | [21-TESTING.md](./21-TESTING.md) | 🆕 Testing strategy — unit, integration, contract, E2E, CI pipeline |
 | [22-CLAW.md](./22-CLAW.md) | 🆕 Claw adapter — system ops muscle, whitelist, 3-layer defense |
-| [23-DATA-STRUCTURES.md](./23-DATA-STRUCTURES.md) | 🆕 Complete cross-organ types — Frame, Blood, Memory, INK, Pulse, Errors |
-| [24-EDGE-CASES.md](./24-EDGE-CASES.md) | 🆕 Seam 1 — orphan cascade, partial-refund flow, PACT reload race, dispatch reservation race |
-| [25-FAILURE-MODES.md](./25-FAILURE-MODES.md) | 🆕 Seam 2 — circuit breaker, disk-full degradation, key rotation, memory corruption, sense death |
-| [26-RECOVERY-PATTERNS.md](./26-RECOVERY-PATTERNS.md) | 🆕 Seam 3 — checkpoint replay, resume after `body.die`, orphan GC + harvest |
-| [27-SIPHON-GENERALIZED.md](./27-SIPHON-GENERALIZED.md) | 🆕 Seam 4 — unified extraction across Pi/Cursor/Claude/OpenCode/A2A, merge conflict policy, non-Cursor recap injection |
-| [28-SECURITY-MODEL.md](./28-SECURITY-MODEL.md) | 🆕 Seam 5 — trust bootstrap, identity binding, frame replay defense, side-channel surface, audit replay |
+| [23-DATA-STRUCTURES.md](./23-DATA-STRUCTURES.md) | 🆕 **Canonical** cross-organ types — Frame, Blood, Memory, INK, Pulse, Errors. **Reconciled (Round 4)** with §§23.11–23.19 covering everything introduced in 24–28 |
+| [24-EDGE-CASES.md](./24-EDGE-CASES.md) | 🆕 Seam 1 — orphan cascade, partial-refund flow, PACT reload race, dispatch reservation race · _types live in §23.12 / §23.14 / §23.19_ |
+| [25-FAILURE-MODES.md](./25-FAILURE-MODES.md) | 🆕 Seam 2 — circuit breaker, disk-full degradation, key rotation, memory corruption, sense death · _types live in §23.16 / §23.17 / §23.18 / §23.19_ |
+| [26-RECOVERY-PATTERNS.md](./26-RECOVERY-PATTERNS.md) | 🆕 Seam 3 — checkpoint replay, resume after `body.die`, orphan GC + harvest · _types live in §23.14 / §23.19_ |
+| [27-SIPHON-GENERALIZED.md](./27-SIPHON-GENERALIZED.md) | 🆕 Seam 4 — unified extraction across Pi/Cursor/Claude/OpenCode/A2A, merge conflict policy, non-Cursor recap injection · _types live in §23.3 / §23.15 / §23.19_ |
+| [28-SECURITY-MODEL.md](./28-SECURITY-MODEL.md) | 🆕 Seam 5 — trust bootstrap, identity binding, frame replay defense, side-channel surface, audit replay · _types live in §23.6 / §23.11 / §23.13 / §23.17 / §23.18 / §23.19_ |
+| [29-RECONCILIATION.md](./29-RECONCILIATION.md) | 🆕 **Round 4 reconciliation changelog** — what was added to SPEC-23, what was de-duplicated in 24–28, conflicts resolved, what's still open |
 | [adr/README.md](./adr/README.md) | Optional ADR template for irreversible choices |
 | [RISKS-AND-OPEN-QUESTIONS.md](./RISKS-AND-OPEN-QUESTIONS.md) | Decisions pending and failure modes |
 
@@ -69,3 +70,12 @@ This folder is the **single place** for vision, corrected assumptions, architect
 ## Document control
 
 When you change behavior in code, update **02** or **03** first or in the same PR. Spec drift is a bug.
+
+### Type drift control (Round 4 reconciliation)
+
+**SPEC-23 is the single source of truth for every type that crosses organ boundaries.** Specs 24–28 reference §23.x sections instead of redefining types inline. If you need to add a new cross-organ type:
+
+1. Add it to **SPEC-23** first (pick the closest §23.11–§23.19 bucket, or open a new sub-section).
+2. Reference it from the consuming spec(s) — never copy the definition.
+3. CI runs `scripts/check-schema-parity.ts` + a duplicate-`export interface` scan across `packages/body/src/**`. Drift fails the build.
+4. Record the change in [`29-RECONCILIATION.md`](./29-RECONCILIATION.md) under the "Future" section so the next reconciliation pass picks it up.

@@ -2,8 +2,8 @@
 
 > SEAM 3 of 5. Death is a state, not an end. Three recovery primitives that turn the ledger from an audit log into a resurrection protocol.
 
-**Status:** Draft · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
-**Depends on:** SPEC-19, SPEC-23, SPEC-24, SPEC-25
+**Status:** Draft (Reconciled — Round 4) · **Author:** VENOM + Cursor Opus 4.7 · **Date:** 2026-05-12
+**Depends on:** SPEC-19, SPEC-23, SPEC-24, SPEC-25 (canonical types: §23.14 `TaskCheckpoint`/`OrphanRecord`/`OrphanCause`/`HarvestManifest`/`ReplayPlan`/`GcReport`, §23.19 error codes)
 
 ---
 
@@ -17,38 +17,7 @@ A task tree can die anywhere. On reboot, the ledger contains every completed ste
 
 ### Minimal checkpoint shape
 
-```ts
-// packages/body/src/blood/checkpoint.ts
-export interface TaskCheckpoint {
-  id: string;                      // uuidv7
-  ts: string;
-  rootTaskId: string;
-  taskId: string;
-  agentId: string;
-  parentTaskId: string | null;
-  lineage: LineageHop[];
-  depth: number;
-
-  state: 'queued' | 'dispatched' | 'running' | 'awaiting-child' | 'completing';
-  pactPin: { version: number; sha: string };
-  budgetRemaining: BudgetRequest;
-  reservationIds: string[];        // active budget reservations owned by this task
-
-  childCompletions: Array<{
-    correlationId: string;
-    taskId: string;
-    status: 'ok' | 'partial' | 'failed' | 'timeout';
-    artifactsSha: string;          // hash of returned artifacts; for idempotent replay
-    sealedAt: string;
-  }>;
-
-  resultHash?: string;             // set in 'completing' state, before final write
-  resumePolicy: 'auto' | 'prompt' | 'orphan';
-  deadline: string;
-}
-```
-
-Stored as `BloodEntryType: 'task.checkpoint'` so checkpoints share storage, rotation, and audit with everything else. The latest checkpoint per `taskId` wins on replay (`max(ts)`).
+`TaskCheckpoint`, `TaskCheckpointState`, and `ChildCompletion` are defined canonically in **SPEC-23.14**. Stored as `BloodEntryType: 'task.checkpoint'` so checkpoints share storage, rotation, and audit with everything else. The latest checkpoint per `taskId` wins on replay (`max(ts)`).
 
 ### When TaskPump writes checkpoints
 
@@ -89,8 +58,12 @@ The "running" throttle is bounded — under 5s of activity goes unflushed; accep
 
 ### Replay algorithm — boot-time reconstruction
 
+`ReplayPlan` is defined canonically in **SPEC-23.14**.
+
 ```ts
 // packages/body/src/blood/replay.ts
+import type { ReplayPlan } from '@fangai/body/types';
+
 export async function planReplay(ledger: BloodLedger, now = new Date()): Promise<ReplayPlan> {
   // 1. Stream ledger; build per-rootTaskId state.
   const trees = new Map<string, RootTreeState>();
@@ -291,8 +264,12 @@ gc:
 
 ### Scanner
 
+`GcReport` is defined canonically in **SPEC-23.14**.
+
 ```ts
 // packages/body/src/recovery/orphan-gc.ts
+import type { GcReport } from '@fangai/body/types';
+
 export class OrphanGc {
   async scanAndCollect(): Promise<GcReport> {
     const cutoff = new Date(Date.now() - this.cfg.ageBeforeGcMs).toISOString();
@@ -398,19 +375,9 @@ Each test runs a real `Body` against `FakeMuscle` instances with optional `probe
 
 ## 26.5 Recovery-Related Error Codes & Pulses (Additions)
 
-```ts
-export type RecoveryErrorCode =
-  | 'TASK_UNCERTAIN'             // 'completing' without `task.end` + muscle has no cache
-  | 'TASK_AGED_OUT'              // older than maxAgeMs
-  | 'PACT_EVICTED'               // pinned PACT no longer retained
-  | 'RESERVATION_NO_LONGER_AVAILABLE';
+> Canonicalised in **SPEC-23.19**. Listed here for spec-local readability.
 
-// PulseKind additions
-| 'replay.plan-built'
-| 'task.resumed' | 'task.uncertain' | 'task.gc'
-| 'muscle.awaiting' | 'muscle.reattach'
-| 'orphan.gc.scanning' | 'orphan.gc.harvesting' | 'orphan.gc.completed'
-| 'pact.pin-rehydrated' | 'budget.re-reserved';
-```
+- **`RecoveryErrorCode`:** `TASK_UNCERTAIN`, `TASK_AGED_OUT`, `PACT_EVICTED`, `RESERVATION_NO_LONGER_AVAILABLE`
+- **`PulseKind` adds:** `replay.plan-built`, `task.resumed`, `task.uncertain`, `task.gc`, `muscle.awaiting`, `muscle.reattach`, `orphan.gc.scanning`, `orphan.gc.harvesting`, `orphan.gc.completed`, `pact.pin-rehydrated`, `budget.re-reserved`
 
 🐙
