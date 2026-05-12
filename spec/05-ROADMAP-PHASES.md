@@ -4,14 +4,20 @@ Phases are **sequential** unless marked parallel. Each phase ends with **mergeab
 
 ---
 
-## Phase 0 — Lock the spec (done when this folder is accepted)
+## Phase 0 — VENOM∞ Body Machine Blueprint ✅ (2026-05-12)
 
-**Outcomes**
+**Status:** COMPLETE — specs written by VENOM + Cursor Opus 4.7
 
-- Vision, architecture target, and blueprint corrections are team/agreed.
-- `04-VERSION-MATRIX.md` matches reality.
+**Specs delivered:**
+- `17-INK-WIRE.md` — INK dispatch language (14-field payload, selectors, budget, recursion, decline/counter-offer)
+- `18-PACT.md` — Body constitution (YAML schema, signature chain, enforcement, 10 error codes)
+- `19-BODY-BOOT.md` — Body.boot() entry point (11-phase sequence, config, health, hot reload)
+- `20-PHASE-0-PLAN.md` — Day-by-day migration plan (5 days, 5 commits, zero test breakage)
+- `21-TESTING.md` — Testing strategy (unit, integration, contract, SIPHON, fitness, pact, E2E, CI)
+- `22-CLAW.md` — System operations muscle (whitelist registry, 3-layer defense, diagnostic instrument)
+- `23-DATA-STRUCTURES.md` — Complete cross-organ types (Frame, Blood, Memory, INK, Pulse, Fitness, Errors)
 
-**Exit:** Tag `spec-v0` or equivalent.
+**Next:** Phase 0 Implementation — Day 1: folder structure + package manifest (see SPEC-20)
 
 ---
 

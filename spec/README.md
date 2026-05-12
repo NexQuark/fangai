@@ -23,6 +23,13 @@ This folder is the **single place** for vision, corrected assumptions, architect
 | [14-SECURITY-AND-TRUST-BOUNDARIES.md](./14-SECURITY-AND-TRUST-BOUNDARIES.md) | Threat model, what Fang does not promise |
 | [15-UPSTREAM-PI-AND-OPencode.md](./15-UPSTREAM-PI-AND-OPencode.md) | Source-of-truth links: [pi-mono](https://github.com/badlogic/pi-mono), [OpenCode](https://github.com/anomalyco/opencode), paths + Fang alignment |
 | [16-RELEASE-CHECKLIST.md](./16-RELEASE-CHECKLIST.md) | Pre-publish build, tests, smoke, and security snapshot |
+| [17-INK-WIRE.md](./17-INK-WIRE.md) | 🆕 INK dispatch language — full wire protocol, selectors, budget, recursion |
+| [18-PACT.md](./18-PACT.md) | 🆕 Body constitution — YAML schema, signature chain, enforcement rules |
+| [19-BODY-BOOT.md](./19-BODY-BOOT.md) | 🆕 Body.boot() — 11-phase boot sequence, config, health, hot reload |
+| [20-PHASE-0-PLAN.md](./20-PHASE-0-PLAN.md) | 🆕 Phase 0 migration — day-by-day plan, 5 days, 5 commits |
+| [21-TESTING.md](./21-TESTING.md) | 🆕 Testing strategy — unit, integration, contract, E2E, CI pipeline |
+| [22-CLAW.md](./22-CLAW.md) | 🆕 Claw adapter — system ops muscle, whitelist, 3-layer defense |
+| [23-DATA-STRUCTURES.md](./23-DATA-STRUCTURES.md) | 🆕 Complete cross-organ types — Frame, Blood, Memory, INK, Pulse, Errors |
 | [adr/README.md](./adr/README.md) | Optional ADR template for irreversible choices |
 | [RISKS-AND-OPEN-QUESTIONS.md](./RISKS-AND-OPEN-QUESTIONS.md) | Decisions pending and failure modes |
 
