@@ -2,6 +2,7 @@
  * Tests for CursorAgentAdapter — the v2 cursor-agent CLI adapter
  */
 import { describe, it, expect } from 'vitest';
+import { detectAdapter as detectAdapterV2 } from '../adapters.ts';
 import { CursorAgentAdapter, CursorSessionStore } from '../cursor-adapter.ts';
 import type { AgentTask, FangConfig } from '../core.ts';
 
@@ -44,6 +45,34 @@ describe('CursorSessionStore', () => {
     store.clear();
     expect(store.lastSession).toBeNull();
     expect(store.list()).toHaveLength(0);
+  });
+
+  it('expireLastSessionIfStale drops session and queues recap when turns exist', () => {
+    const store = new CursorSessionStore({ sessionTtlMs: 60_000 });
+    store.register('sess-old', '/w', 'm');
+    store.recordCompletedTurn('sess-old', 'user says', 'assistant says');
+    const sess = store.get('sess-old')!;
+    sess.lastUsedAt = new Date(Date.now() - 120_000);
+
+    store.expireLastSessionIfStale();
+    expect(store.lastSession).toBeNull();
+    expect(store.get('sess-old')).toBeUndefined();
+
+    const recap = store.consumeColdRecap();
+    expect(recap).toContain('user says');
+    expect(recap).toContain('assistant says');
+    expect(store.consumeColdRecap()).toBeNull();
+  });
+
+  it('expireLastSessionIfStale clears stale session without recap when no turns', () => {
+    const store = new CursorSessionStore({ sessionTtlMs: 1000 });
+    store.register('sess-x', '/w', 'm');
+    const sess = store.get('sess-x')!;
+    sess.lastUsedAt = new Date(Date.now() - 5000);
+
+    store.expireLastSessionIfStale();
+    expect(store.lastSession).toBeNull();
+    expect(store.consumeColdRecap()).toBeNull();
   });
 });
 
@@ -177,10 +206,65 @@ describe('CursorAgentAdapter', () => {
       expect(adapter.parseLine('   ')).toHaveLength(0);
     });
 
-    it('passes non-JSON text as text-delta', () => {
-      const events = adapter.parseLine('some startup message');
-      expect(events[0].type).toBe('text-delta');
-      if (events[0].type === 'text-delta') expect(events[0].text).toBe('some startup message');
+    it('skips --continue after TTL expiry', () => {
+      const store = new CursorSessionStore({ sessionTtlMs: 1 });
+      store.register('old', '/w', 'm');
+      store.get('old')!.lastUsedAt = new Date(Date.now() - 10_000);
+
+      const adapter = new CursorAgentAdapter({ sessionStore: store, streamPartial: true });
+      const args = adapter.buildArgs(dummyTask, dummyConfig);
+      expect(args).not.toContain('--continue');
+    });
+
+    it('prepends cold recap in formatInput after TTL expiry', () => {
+      const store = new CursorSessionStore({ sessionTtlMs: 1 });
+      store.register('old', '/w', 'm');
+      store.recordCompletedTurn('old', 'ping', 'pong');
+      store.get('old')!.lastUsedAt = new Date(Date.now() - 10_000);
+
+      const adapter = new CursorAgentAdapter({ sessionStore: store, streamPartial: true });
+      adapter.buildArgs(dummyTask, dummyConfig);
+      const stdin = adapter.formatInput(dummyTask);
+      expect(stdin).toContain('ping');
+      expect(stdin).toContain('pong');
+      expect(stdin).toContain('fix the bug in auth.ts');
+    });
+
+    it('discards cold recap when metadata.newChat is true', () => {
+      const store = new CursorSessionStore({ sessionTtlMs: 1 });
+      store.register('old', '/w', 'm');
+      store.recordCompletedTurn('old', 'a', 'b');
+      store.get('old')!.lastUsedAt = new Date(Date.now() - 10_000);
+
+      const adapter = new CursorAgentAdapter({ sessionStore: store, streamPartial: true });
+      const task: AgentTask = {
+        id: 't2',
+        message: 'fresh',
+        context: { metadata: { newChat: true } },
+      };
+      adapter.buildArgs(task, dummyConfig);
+      const stdin = adapter.formatInput(task);
+      expect(stdin).toBe('fresh\n');
+    });
+
+    it('records completed turns for recap', () => {
+      const store = new CursorSessionStore();
+      const adapter = new CursorAgentAdapter({ sessionStore: store, streamPartial: true });
+      adapter.formatInput(dummyTask);
+      adapter.parseLine(JSON.stringify({
+        type: 'system', subtype: 'init', session_id: 's-recap', cwd: '/p', model: 'm',
+      }));
+      adapter.parseLine(JSON.stringify({
+        type: 'assistant',
+        timestamp_ms: 1,
+        message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
+      }));
+      adapter.parseLine(JSON.stringify({ type: 'result', subtype: 'success' }));
+
+      const s = store.get('s-recap');
+      expect(s?.turns).toHaveLength(1);
+      expect(s?.turns[0]?.user).toContain('fix the bug');
+      expect(s?.turns[0]?.assistant).toBe('done');
     });
   });
 
@@ -235,10 +319,6 @@ describe('CursorAgentAdapter', () => {
     });
   });
 });
-
-// ─── detectAdapter with cursor-agent ─────────────────────────────────────
-
-import { detectAdapter as detectAdapterV2 } from '../adapters.ts';
 
 describe('detectAdapter with cursor-agent', () => {
   it('detects cursor-agent via fallback', () => {

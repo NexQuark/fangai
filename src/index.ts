@@ -13,7 +13,7 @@ export {
   ALL_ADAPTERS,
 } from './adapters.ts';
 export { CursorAgentAdapter, CursorSessionStore } from './cursor-adapter.ts';
-export type { CursorAdapterOptions, CursorSession } from './cursor-adapter.ts';
+export type { CursorAdapterOptions, CursorSession, CursorSessionTurn, CursorSessionStoreOptions } from './cursor-adapter.ts';
 export { BridgeExecutor, createFangServer } from './server.ts';
 export { FangClient, discoverAgents } from './client.ts';
 export { ProcessManager, PersistentProcess, detectAdapters } from './core.ts';

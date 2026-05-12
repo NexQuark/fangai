@@ -27,6 +27,12 @@ const execFileAsync = promisify(execFile);
 
 // ─── Session Management ────────────────────────────────────────────────────
 
+/** One exchange kept for cold-start recap when server-side session TTL is exceeded. */
+export interface CursorSessionTurn {
+  user: string;
+  assistant: string;
+}
+
 export interface CursorSession {
   id: string;
   createdAt: Date;
@@ -34,6 +40,20 @@ export interface CursorSession {
   workspace: string;
   model: string;
   turnCount: number;
+  /** Last N completed turns (user + assistant text) for recap after --continue is unsafe. */
+  turns: CursorSessionTurn[];
+}
+
+export interface CursorSessionStoreOptions {
+  /**
+   * Max age since `lastUsedAt` before we drop `lastSession`, skip `--continue`, and inject a recap.
+   * `null` / omitted = no TTL (legacy behaviour).
+   */
+  sessionTtlMs?: number | null;
+  /** Max completed turns to retain per session and to include in a cold recap. */
+  recapMaxTurns?: number;
+  /** Max chars per turn leg stored / echoed in recap (limits huge tool dumps). */
+  recapMaxCharsPerLeg?: number;
 }
 
 /**
@@ -43,6 +63,17 @@ export interface CursorSession {
 export class CursorSessionStore {
   private sessions = new Map<string, CursorSession>();
   private lastSessionId: string | null = null;
+  private readonly sessionTtlMs: number | null;
+  private readonly recapMaxTurns: number;
+  private readonly recapMaxCharsPerLeg: number;
+  /** Picked up on the next `formatInput` after TTL expiry of `lastSession`. */
+  private coldRecapPending: string | null = null;
+
+  constructor(opts: CursorSessionStoreOptions = {}) {
+    this.sessionTtlMs = opts.sessionTtlMs === undefined ? null : opts.sessionTtlMs;
+    this.recapMaxTurns = opts.recapMaxTurns ?? 8;
+    this.recapMaxCharsPerLeg = opts.recapMaxCharsPerLeg ?? 8000;
+  }
 
   /** Register a new session from cursor-agent output */
   register(sessionId: string, workspace: string, model: string): void {
@@ -58,9 +89,51 @@ export class CursorSessionStore {
         workspace,
         model,
         turnCount: 1,
+        turns: [],
       });
     }
     this.lastSessionId = sessionId;
+  }
+
+  /**
+   * If the current `lastSession` is older than `sessionTtlMs`, remove it from the store,
+   * queue a cold recap for the next prompt, and clear `lastSession` so the next spawn is fresh.
+   */
+  expireLastSessionIfStale(nowMs: number = Date.now()): void {
+    if (this.sessionTtlMs === null || this.lastSessionId === null) return;
+    const s = this.sessions.get(this.lastSessionId);
+    if (!s) {
+      this.lastSessionId = null;
+      return;
+    }
+    if (nowMs - s.lastUsedAt.getTime() <= this.sessionTtlMs) return;
+
+    const recap = this.buildRecapBlock(s.turns);
+    if (recap) this.coldRecapPending = recap;
+
+    this.sessions.delete(this.lastSessionId);
+    this.lastSessionId = null;
+  }
+
+  /**
+   * Pop the cold recap block (from TTL expiry) once, for the next user message.
+   */
+  consumeColdRecap(): string | null {
+    const r = this.coldRecapPending;
+    this.coldRecapPending = null;
+    return r;
+  }
+
+  /** Append a completed turn after a successful `result` event. */
+  recordCompletedTurn(sessionId: string | null, user: string, assistant: string): void {
+    if (!sessionId) return;
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    s.turns.push({
+      user: this.truncateLeg(user),
+      assistant: this.truncateLeg(assistant.trim()),
+    });
+    while (s.turns.length > this.recapMaxTurns) s.turns.shift();
   }
 
   /** Get the last active session ID for --continue */
@@ -84,6 +157,32 @@ export class CursorSessionStore {
   clear(): void {
     this.sessions.clear();
     this.lastSessionId = null;
+    this.coldRecapPending = null;
+  }
+
+  private truncateLeg(text: string): string {
+    const t = text.trim();
+    if (t.length <= this.recapMaxCharsPerLeg) return t;
+    return `${t.slice(0, this.recapMaxCharsPerLeg)}\n…[truncated]`;
+  }
+
+  private buildRecapBlock(turns: CursorSessionTurn[]): string | null {
+    if (!turns.length) return null;
+    const lines: string[] = [
+      '[Fang: Prior Cursor server session likely expired or this is a cold reconnect. Continuity recap — background only; answer the new user message after the separator.]',
+      '',
+      '### Earlier turns (recap)',
+    ];
+    const slice = turns.slice(-this.recapMaxTurns);
+    for (let i = 0; i < slice.length; i++) {
+      const t = slice[i]!;
+      lines.push(`${i + 1}. **User:** ${t.user}`);
+      lines.push(`   **Assistant:** ${t.assistant}`);
+      lines.push('');
+    }
+    lines.push('---');
+    lines.push('');
+    return lines.join('\n');
   }
 }
 
@@ -108,6 +207,13 @@ export interface CursorAdapterOptions {
   mcpServers?: string[];
   /** Session store (shared across adapter instances for multi-chat) */
   sessionStore?: CursorSessionStore;
+  /**
+   * When set (and no custom `sessionStore`), builds a store with TTL + recap.
+   * Ignored if `sessionStore` is provided — configure the store yourself in that case.
+   */
+  sessionTtlMs?: number | null;
+  recapMaxTurns?: number;
+  recapMaxCharsPerLeg?: number;
 }
 
 /**
@@ -123,6 +229,10 @@ export interface CursorAdapterOptions {
  *
  * Each Fang task is a separate cursor-agent process, but sessions persist server-side
  * at Cursor. The adapter tracks session_ids to route follow-ups via --continue.
+ *
+ * If `sessionTtlMs` is set on the store, stale server sessions are abandoned (no `--continue`)
+ * and a short recap of the last N turns is injected into the next prompt so cold starts keep
+ * continuity without relying on Cursor holding the session forever.
  */
 export class CursorAgentAdapter implements AgentAdapter {
   readonly id = 'cursor-agent';
@@ -140,6 +250,10 @@ export class CursorAgentAdapter implements AgentAdapter {
   readonly mcpServers: string[];
   readonly sessionStore: CursorSessionStore;
 
+  /** Accumulated assistant-visible output for the current task (recap storage). */
+  private taskUserForRecap = '';
+  private taskAssistantForRecap = '';
+
   skills = [
     { id: 'code', name: 'Code generation & editing', tags: ['typescript', 'python', 'react', 'go', 'rust'] },
     { id: 'reasoning', name: 'Complex reasoning', tags: ['reasoning', 'architecture', 'debugging', 'design'] },
@@ -151,14 +265,18 @@ export class CursorAgentAdapter implements AgentAdapter {
 
   constructor(opts: CursorAdapterOptions = {}) {
     this.binary = opts.binary ?? 'cursor-agent';
-    this.defaultModel = opts.defaultModel ?? 'composer-2-fast';
+    this.defaultModel = opts.defaultModel ?? 'gpt-5.3-codex';
     this.streamPartial = opts.streamPartial ?? true;
     this.yolo = opts.yolo ?? true;
     this.trust = opts.trust ?? true;
     this.maxSessionTurns = opts.maxSessionTurns ?? 50;
     this.useWorktrees = opts.useWorktrees ?? false;
     this.mcpServers = opts.mcpServers ?? [];
-    this.sessionStore = opts.sessionStore ?? new CursorSessionStore();
+    this.sessionStore = opts.sessionStore ?? new CursorSessionStore({
+      sessionTtlMs: opts.sessionTtlMs,
+      recapMaxTurns: opts.recapMaxTurns,
+      recapMaxCharsPerLeg: opts.recapMaxCharsPerLeg,
+    });
   }
 
   buildArgs(task: AgentTask, config: FangConfig): string[] {
@@ -187,6 +305,8 @@ export class CursorAgentAdapter implements AgentAdapter {
     if (workspace) {
       args.push('--workspace', workspace);
     }
+
+    this.sessionStore.expireLastSessionIfStale();
 
     // Session continuity: continue last session or resume specific one
     const resumeSession = task.context?.metadata?.resumeSession as string | undefined;
@@ -234,7 +354,17 @@ export class CursorAgentAdapter implements AgentAdapter {
     // The prompt is passed as the first positional argument to cursor-agent,
     // NOT via stdin. But since Fang pipes via stdin, we return the message.
     // cursor-agent --print reads stdin as the prompt when no positional args given.
-    return task.message + '\n';
+    this.taskAssistantForRecap = '';
+    this.taskUserForRecap = task.message;
+    const newChat = task.context?.metadata?.newChat === true;
+    let recap: string | null = null;
+    if (newChat) {
+      this.sessionStore.consumeColdRecap();
+    } else {
+      recap = this.sessionStore.consumeColdRecap();
+    }
+    const body = `${task.message}\n`;
+    return recap ? `${recap}${body}` : body;
   }
 
   parseLine(line: string): AdapterEvent[] {
@@ -281,6 +411,7 @@ export class CursorAgentAdapter implements AgentAdapter {
         for (const block of content) {
           if (block.type === 'text' && block.text) {
             events.push({ type: 'text-delta', text: block.text });
+            this.taskAssistantForRecap += block.text;
           }
           // Thinking blocks could be here too in some models
           if (block.type === 'thinking' && block.thinking) {
@@ -314,6 +445,7 @@ export class CursorAgentAdapter implements AgentAdapter {
           const stdout = result.stdout?.trim();
           if (stdout) {
             events.push({ type: 'text-delta', text: stdout });
+            this.taskAssistantForRecap += stdout;
           }
           events.push({
             type: 'tool-result',
@@ -330,6 +462,7 @@ export class CursorAgentAdapter implements AgentAdapter {
       // ── Result (completion) ─────────────────────────────────────────
       case 'result': {
         if (obj.subtype === 'error' || obj.is_error) {
+          this.resetRecapTaskState();
           return [{ type: 'error', message: obj.result || 'Cursor agent error' }];
         }
 
@@ -343,6 +476,13 @@ export class CursorAgentAdapter implements AgentAdapter {
           // Don't re-emit to avoid duplication
         }
 
+        this.sessionStore.recordCompletedTurn(
+          this.sessionStore.lastSession,
+          this.taskUserForRecap,
+          this.taskAssistantForRecap,
+        );
+        this.resetRecapTaskState();
+
         events.push({ type: 'status', state: 'completed' });
         return events;
       }
@@ -352,8 +492,10 @@ export class CursorAgentAdapter implements AgentAdapter {
         return [{ type: 'status', state: 'working' }];
 
       // ── Errors ──────────────────────────────────────────────────────
-      case 'error':
+      case 'error': {
+        this.resetRecapTaskState();
         return [{ type: 'error', message: String(obj.message || obj.error || 'Unknown cursor error') }];
+      }
 
       // ── Fallback ────────────────────────────────────────────────────
       default: {
@@ -392,6 +534,11 @@ export class CursorAgentAdapter implements AgentAdapter {
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────
+
+  private resetRecapTaskState(): void {
+    this.taskUserForRecap = '';
+    this.taskAssistantForRecap = '';
+  }
 
   private extractToolName(callData: any): string {
     if (!callData) return 'tool';
