@@ -4,8 +4,15 @@
  * Entry point — re-exports everything and runs CLI.
  */
 
-import { PiAdapter, ClaudeAdapter, AiderAdapter, CodexAdapter, GeminiAdapter, OpenCodeAdapter, GenericAdapter, detectAdapter, ALL_ADAPTERS } from './adapters.ts';
-export { CursorAgentAdapter, CursorSDKAdapter, CursorSessionStore } from './cursor-adapter.ts';
+export {
+  PiAdapter,
+  ClaudeAdapter,
+  OpenCodeAdapter,
+  GenericAdapter,
+  detectAdapter,
+  ALL_ADAPTERS,
+} from './adapters.ts';
+export { CursorAgentAdapter, CursorSessionStore } from './cursor-adapter.ts';
 export type { CursorAdapterOptions, CursorSession } from './cursor-adapter.ts';
 export { BridgeExecutor, createFangServer } from './server.ts';
 export { FangClient, discoverAgents } from './client.ts';

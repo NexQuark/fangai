@@ -5,10 +5,6 @@ import { describe, it, expect } from 'vitest';
 import {
   PiAdapter,
   ClaudeAdapter,
-  CursorAdapter,
-  AiderAdapter,
-  CodexAdapter,
-  GeminiAdapter,
   OpenCodeAdapter,
   GenericAdapter,
   detectAdapter,
@@ -259,122 +255,6 @@ describe('ClaudeAdapter', () => {
   });
 });
 
-// ─── AiderAdapter ────────────────────────────────────────────────────────
-
-describe('AiderAdapter', () => {
-  const adapter = new AiderAdapter();
-
-  it('has correct metadata', () => {
-    expect(adapter.id).toBe('aider');
-    expect(adapter.tier).toBe(3);
-    expect(adapter.mode).toBe('oneshot');
-  });
-
-  it('builds args with --yes and --no-auto-commits', () => {
-    const args = adapter.buildArgs(dummyTask, dummyConfig);
-    expect(args).toContain('--yes');
-    expect(args).toContain('--no-auto-commits');
-    expect(args).toContain('--no-pretty');
-  });
-
-  it('appends /exit to input', () => {
-    const input = adapter.formatInput(dummyTask);
-    expect(input).toContain('/exit');
-    expect(input).toContain('fix the bug in auth.ts');
-  });
-
-  it('parses assistant JSON', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'assistant', content: 'Applied changes',
-    }));
-    expect(events[0].type).toBe('text-delta');
-  });
-
-  it('detects "Applied edit to" prefix', () => {
-    const events = adapter.parseLine('Applied edit to src/auth.ts');
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toContain('Applied edit');
-  });
-
-  it('detects error lines', () => {
-    const events = adapter.parseLine('Error: file not found');
-    expect(events[0].type).toBe('error');
-    if (events[0].type === 'error') expect(events[0].message).toContain('file not found');
-  });
-
-  it('passes through unknown text as text-delta', () => {
-    const events = adapter.parseLine('some random output');
-    expect(events[0].type).toBe('text-delta');
-  });
-});
-
-// ─── CodexAdapter ────────────────────────────────────────────────────────
-
-describe('CodexAdapter', () => {
-  const adapter = new CodexAdapter();
-
-  it('has correct metadata', () => {
-    expect(adapter.id).toBe('codex');
-    expect(adapter.tier).toBe(1);
-  });
-
-  it('builds --json args', () => {
-    expect(adapter.buildArgs(dummyTask, dummyConfig)).toContain('--json');
-  });
-
-  it('parses item.content_part.delta', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'item.content_part.delta', text: 'response text',
-    }));
-    expect(events[0].type).toBe('text-delta');
-  });
-
-  it('parses turn.completed', () => {
-    const events = adapter.parseLine(JSON.stringify({ type: 'turn.completed' }));
-    expect(events[0].type).toBe('status');
-    if (events[0].type === 'status') expect(events[0].state).toBe('completed');
-  });
-
-  it('parses item.tool_call', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'item.tool_call', name: 'edit_file', input: { path: 'x.ts' },
-    }));
-    expect(events[0].type).toBe('tool-call');
-    if (events[0].type === 'tool-call') expect(events[0].tool).toBe('edit_file');
-  });
-});
-
-// ─── GeminiAdapter ────────────────────────────────────────────────────────
-
-describe('GeminiAdapter', () => {
-  const adapter = new GeminiAdapter();
-
-  it('builds --acp args', () => {
-    expect(adapter.buildArgs(dummyTask, dummyConfig)).toContain('--acp');
-  });
-
-  it('formats input as JSON-RPC', () => {
-    const input = adapter.formatInput(dummyTask);
-    const parsed = JSON.parse(input);
-    expect(parsed.jsonrpc).toBe('2.0');
-    expect(parsed.method).toBe('session/prompt');
-    expect(parsed.params.prompt).toBe('fix the bug in auth.ts');
-  });
-
-  it('parses session/new as working', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      method: 'session/new', result: { sessionId: 'abc' },
-    }));
-    expect(events[0].type).toBe('status');
-    if (events[0].type === 'status') expect(events[0].state).toBe('working');
-  });
-
-  it('parses result.text', () => {
-    const events = adapter.parseLine(JSON.stringify({ result: { text: 'output' } }));
-    expect(events[0].type).toBe('text-delta');
-  });
-});
-
 // ─── OpenCodeAdapter ──────────────────────────────────────────────────────
 
 describe('OpenCodeAdapter', () => {
@@ -402,117 +282,6 @@ describe('OpenCodeAdapter', () => {
     const events = adapter.parseLine(JSON.stringify({ type: 'done' }));
     expect(events[0].type).toBe('status');
     if (events[0].type === 'status') expect(events[0].state).toBe('completed');
-  });
-});
-
-// ─── CursorAdapter ────────────────────────────────────────────────────────
-
-describe('CursorAdapter', () => {
-  const adapter = new CursorAdapter();
-
-  it('has correct metadata', () => {
-    expect(adapter.id).toBe('cursor');
-    expect(adapter.tier).toBe(1);
-    expect(adapter.mode).toBe('oneshot');
-    expect(adapter.binary).toBe('agent');
-  });
-
-  it('parses assistant message with nested content', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'assistant',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Here is the fix for auth.ts' }],
-      },
-    }));
-    expect(events).toHaveLength(1);
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toBe('Here is the fix for auth.ts');
-  });
-
-  it('parses assistant with multiple content blocks', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'assistant',
-      message: {
-        role: 'assistant',
-        content: [
-          { type: 'text', text: 'Part one. ' },
-          { type: 'text', text: 'Part two.' },
-        ],
-      },
-    }));
-    expect(events).toHaveLength(1);
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toBe('Part one. Part two.');
-  });
-
-  it('returns empty for assistant with no content array', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'assistant',
-      message: { role: 'assistant' },
-    }));
-    expect(events).toHaveLength(0);
-  });
-
-  it('returns empty for assistant with empty content', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'assistant',
-      message: { role: 'assistant', content: [] },
-    }));
-    expect(events).toHaveLength(0);
-  });
-
-  it('parses text_delta events', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'text_delta', text: 'streaming text',
-    }));
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toBe('streaming text');
-  });
-
-  it('parses content_block_delta with nested delta.text', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'content_block_delta', delta: { text: 'delta text' },
-    }));
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toBe('delta text');
-  });
-
-  it('parses result as completed', () => {
-    const events = adapter.parseLine(JSON.stringify({ type: 'result' }));
-    expect(events[0].type).toBe('status');
-    if (events[0].type === 'status') expect(events[0].state).toBe('completed');
-  });
-
-  it('parses system events as empty', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'system', subtype: 'init', session_id: 'abc',
-    }));
-    expect(events).toHaveLength(0);
-  });
-
-  it('parses user events as empty', () => {
-    const events = adapter.parseLine(JSON.stringify({
-      type: 'user', message: { role: 'user', content: [] },
-    }));
-    expect(events).toHaveLength(0);
-  });
-
-  it('parses error type', () => {
-    const events = adapter.parseLine(JSON.stringify({ type: 'error', message: 'fail' }));
-    expect(events[0].type).toBe('error');
-    if (events[0].type === 'error') expect(events[0].message).toBe('fail');
-  });
-
-  it('returns empty for blank lines', () => {
-    expect(adapter.parseLine('')).toHaveLength(0);
-    expect(adapter.parseLine('   ')).toHaveLength(0);
-  });
-
-  it('passes non-JSON text as text-delta', () => {
-    const events = adapter.parseLine('some plain text');
-    expect(events[0].type).toBe('text-delta');
-    if (events[0].type === 'text-delta') expect(events[0].text).toContain('some plain text');
   });
 });
 
@@ -545,16 +314,16 @@ describe('detectAdapter', () => {
     expect(detectAdapter('claude').id).toBe('claude-code');
   });
 
-  it('detects aider from "aider --model gpt-4"', () => {
-    expect(detectAdapter('aider --model gpt-4').id).toBe('aider');
+  it('falls back to generic for "aider --model gpt-4" (not in fleet)', () => {
+    expect(detectAdapter('aider --model gpt-4').id).toBe('generic');
   });
 
-  it('detects codex from "codex --json"', () => {
-    expect(detectAdapter('codex --json').id).toBe('codex');
+  it('falls back to generic for "codex --json" (not in fleet)', () => {
+    expect(detectAdapter('codex --json').id).toBe('generic');
   });
 
-  it('detects gemini from "gemini --acp"', () => {
-    expect(detectAdapter('gemini --acp').id).toBe('gemini');
+  it('falls back to generic for "gemini --acp" (not in fleet)', () => {
+    expect(detectAdapter('gemini --acp').id).toBe('generic');
   });
 
   it('detects opencode from "opencode -f json"', () => {
@@ -581,8 +350,8 @@ describe('detectAdapter', () => {
     expect(detectAdapter('/usr/local/bin/claude --print').id).toBe('claude-code');
   });
 
-  it('matches binary with relative path', () => {
-    expect(detectAdapter('./node_modules/.bin/codex').id).toBe('codex');
+  it('falls back to generic for codex binary path (not in fleet)', () => {
+    expect(detectAdapter('./node_modules/.bin/codex').id).toBe('generic');
   });
 
   it('handles empty string', () => {

@@ -9,6 +9,18 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
+// ─── Structured Logging ─────────────────────────────────────────────────
+
+function log(level: string, msg: string, data?: Record<string, unknown>): void {
+  const entry: Record<string, unknown> = {
+    ts: new Date().toISOString(),
+    l: level,
+    m: msg,
+    ...(data ?? {}),
+  };
+  process.stderr.write(JSON.stringify(entry) + '\n');
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────
 
 export interface AgentTask {
@@ -163,6 +175,7 @@ export class ProcessManager {
       env: { ...process.env as Record<string, string>, ...opts.env },
     });
     this.processes.set(taskId, proc);
+    log('info', 'process_spawned', { taskId, cmd, pid: proc.pid });
 
     // LF-only JSONL reader — protocol compliant
     const detach = attachJsonlReader(proc.stdout!, handlers.onLine);
@@ -179,6 +192,7 @@ export class ProcessManager {
     });
 
     proc.on('exit', (code, signal) => {
+      log('info', 'process_exited', { taskId, code, signal });
       detach();
       this.processes.delete(taskId);
       this.cleanups.delete(taskId);
@@ -188,6 +202,7 @@ export class ProcessManager {
     });
 
     proc.on('error', (err) => {
+      log('error', 'process_error', { taskId, error: err.message });
       detach();
       this.processes.delete(taskId);
       this.cleanups.delete(taskId);
@@ -208,6 +223,7 @@ export class ProcessManager {
   kill(taskId: string, timeout = 5000): void {
     const proc = this.processes.get(taskId);
     if (!proc) return;
+    log('warn', 'process_kill', { taskId, timeout });
     proc.kill('SIGTERM');
     const timer = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
@@ -339,6 +355,7 @@ export class PersistentProcess {
     const responsePromise = new Promise<RpcParsedResponse>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingResponses.delete(cid);
+        log('warn', 'rpc_timeout', { correlationId: cid, command: cmdHint, timeoutMs });
         resolve({
           success: false,
           error: `RPC correlation timeout (${timeoutMs}ms) for command ${cmdHint}`,
@@ -629,7 +646,9 @@ export class PersistentProcess {
     });
 
     this.proc.on('exit', () => {
+      log('warn', 'persistent_exited', { activeTaskId: this.activeTaskId, queuedCount: this.taskQueue.length });
       if (this.detachReader) { this.detachReader(); this.detachReader = null; }
+
 
       for (const [, pend] of [...this.pendingResponses]) {
         try { pend.settle({ success: false, error: 'Persistent process exited before RPC response arrived' }); } catch { /* noop */ }
@@ -690,6 +709,7 @@ export class PersistentProcess {
 
   async kill(): Promise<void> {
     if (this.proc) {
+      log('info', 'persistent_kill', {});
       if (this.detachReader) { this.detachReader(); this.detachReader = null; }
 
       for (const [, pend] of [...this.pendingResponses]) {
