@@ -51,7 +51,7 @@ export class BridgeExecutor implements AgentExecutor {
       .join('\n').trim();
 
     if (!text) {
-      this.publishMessage(bus, taskId, contextId, 'No message text provided.');
+      this.publishMessage(bus, taskId, contextId, 'No message text provided.', 'rejected');
       bus.finished();
       return;
     }
@@ -184,6 +184,8 @@ export class BridgeExecutor implements AgentExecutor {
     }
 
     await this.persistent.ensure();
+    try { await this.persistent.waitUntilReady(30_000); }
+    catch { this.publishMessage(bus, taskId, contextId, 'Persistent process did not become ready within 30s'); bus.finished(); return; }
     if (!this.persistent.isAlive) {
       this.publishMessage(bus, taskId, contextId, 'Failed to start persistent process');
       bus.finished();
@@ -409,11 +411,11 @@ export class BridgeExecutor implements AgentExecutor {
 
   // ─── Helpers ───────────────────────────────────────────────────────────
 
-  private publishMessage(bus: ExecutionEventBus, taskId: string, contextId: string, text: string) {
+  private publishMessage(bus: ExecutionEventBus, taskId: string, contextId: string, text: string, state: 'failed' | 'rejected' = 'failed') {
     this.forgetTrackedTask(taskId);
     bus.publish({
       kind: 'status-update', taskId, contextId, final: true,
-      status: { state: 'failed', message: { kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'text', text }] }, timestamp: new Date().toISOString() },
+      status: { state, message: { kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'text', text }] }, timestamp: new Date().toISOString() },
     });
   }
 
@@ -489,6 +491,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
         if (pq !== null) {
           base.persistentQueue = pq;
         }
+        base.agentAlive = adapter.mode === 'persistent' ? (executor['persistent']?.isAlive ?? false) : null;
         if (adapter instanceof CursorAgentAdapter) {
           const cursorAdapter = adapter as CursorAgentAdapter;
           Object.assign(base, {
