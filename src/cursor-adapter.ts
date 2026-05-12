@@ -265,7 +265,7 @@ export class CursorAgentAdapter implements AgentAdapter {
 
   constructor(opts: CursorAdapterOptions = {}) {
     this.binary = opts.binary ?? 'cursor-agent';
-    this.defaultModel = opts.defaultModel ?? 'gpt-5.3-codex';
+    this.defaultModel = opts.defaultModel ?? 'composer-2-fast';
     this.streamPartial = opts.streamPartial ?? true;
     this.yolo = opts.yolo ?? true;
     this.trust = opts.trust ?? true;
