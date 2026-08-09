@@ -10,19 +10,30 @@
  *                                       supportedInterfaces[*].protocolVersion)
  *
  * These tests are intentionally written against the spec rather than the
- * current (v0.3.0-era) implementation. Several will FAIL until the
+ * current (v0.3.0-era) implementation. The single test that pins the prod
+ * code (`agentCard.protocolVersion === '1.0'`) is expected to fail until the
  * migration in spec/a2a-v1/MIGRATION-fangai.md is complete. That is the
- * point of TDD here — capture the deltas as failing assertions first,
- * then make them green during the upgrade.
+ * point of TDD here — capture the delta as a failing assertion, then make
+ * it green during the upgrade.
  *
  * Important: NO production code in src/ is modified by these tests.
  *
- * Task-seeding strategy: the v1.0.1 JSON-RPC handler rejects requests
- * because the current AgentCard has no `supportedInterfaces` (it uses
- * top-level `protocolVersion`). To exercise the HTTP endpoints without
- * coupling to the JSON-RPC envelope, tests seed tasks via the SDK's
- * DefaultRequestHandler directly (`requestHandler.sendMessage`) — which
- * is what the production Express handlers ultimately call.
+ * Task-seeding strategy: the current `BridgeExecutor` (src/server.ts)
+ * publishes events in v0.3 shape (`{kind: 'task', id, contextId, ...}`),
+ * but @a2a-js/sdk@1.0.1's `ResultManager.processEvent` reads them in v1.0
+ * shape (`{kind: 'task', data: {id, contextId, ...}}`) and throws
+ * `TypeError: Cannot read properties of undefined (reading 'id'/'status')`.
+ * As a result, calling `requestHandler.sendMessage(...)` either:
+ *   (a) with `true`/`echo` (fast CLI): returns a bare Message (not a Task)
+ *       because the executor finishes before the SDK can stash a Task, OR
+ *   (b) with `sleep N` (long-running CLI): hangs forever because the
+ *       executor never settles, so the SDK's event bus never finishes.
+ * Neither outcome is usable for testing the HTTP endpoints, so these
+ * tests bypass `sendMessage` and write directly to the shared `taskStore`
+ * (and the per-task `events` store for SSE) using reflection on the
+ * SDK's private fields. This keeps the HTTP endpoint tests independent
+ * of the executor's broken event shape — a separate set of executor-
+ * level tests will be added once the event-shape migration lands.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -32,31 +43,28 @@ import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import type { AgentAdapter, FangConfig } from '../core.ts';
 import { createFangServer } from '../server.ts';
-import type { ServerCallContext, Task } from '@a2a-js/sdk';
-import { ServerCallContext as ServerCallContextClass } from '@a2a-js/sdk/server';
+import { TaskState } from '@a2a-js/sdk';
+import type { Task } from '@a2a-js/sdk';
 
 // ─── Stub adapter ─────────────────────────────────────────────────────────
 
 /**
- * A minimal AgentAdapter that never spawns anything itself. Tests that need
- * a running task pre-seed the task into the taskStore by going through the
- * SDK's request handler directly.
+ * A minimal AgentAdapter. The HTTP endpoint tests don't drive the executor,
+ * so the CLI choice is mostly cosmetic — `sleep 30` is used so any leaked
+ * process outlives the test (ProcessManager SIGKILLs after taskTimeout).
  */
 class StubAdapter implements AgentAdapter {
-  readonly id: string;
+  readonly id: string = 'stub';
   readonly binary: string;
-  readonly tier: 1 | 2 | 3;
-  readonly displayName: string;
-  readonly mode: 'oneshot' | 'persistent';
-  skills: Array<{ id: string; name: string; tags: string[] }>;
+  readonly tier: 1 | 2 | 3 = 3;
+  readonly displayName: string = 'Stub Adapter';
+  readonly mode: 'oneshot' | 'persistent' = 'oneshot';
+  skills: Array<{ id: string; name: string; tags: string[] }> = [
+    { id: 'code-edit', name: 'code-edit', tags: ['edit'] },
+  ];
 
-  constructor(opts: { id?: string; binary?: string; mode?: 'oneshot' | 'persistent' } = {}) {
-    this.id = opts.id ?? 'stub';
-    this.binary = opts.binary ?? 'true';
-    this.tier = 3;
-    this.displayName = 'Stub Adapter';
-    this.mode = opts.mode ?? 'oneshot';
-    this.skills = [{ id: 'code-edit', name: 'code-edit', tags: ['edit'] }];
+  constructor(opts: { cli?: string } = {}) {
+    this.binary = opts.cli ?? 'sleep 30';
   }
 
   buildArgs(): string[] {
@@ -83,6 +91,11 @@ interface BootedServer {
   url: string;
   agentCard: ReturnType<typeof createFangServer>['agentCard'];
   requestHandler: ReturnType<typeof createFangServer>['requestHandler'];
+  /** Internal — exposed via reflection. Use seedTask/seedEvents helpers. */
+  readonly _internals: {
+    taskStore: { save(t: Task): Promise<void>; load(id: string): Promise<Task | undefined> };
+    events: { append(taskId: string, ev: unknown): number; read(taskId: string, fromSeq?: number): unknown[]; latestSeq(taskId: string): number };
+  };
   close: () => Promise<void>;
 }
 
@@ -91,9 +104,10 @@ async function boot(opts: {
   apiKey?: string;
   adapterMode?: 'oneshot' | 'persistent';
 } = {}): Promise<BootedServer> {
-  const adapter = new StubAdapter({ binary: opts.cli ?? 'true', mode: opts.adapterMode ?? 'oneshot' });
+  const cli = opts.cli ?? 'sleep 30';
+  const adapter = new StubAdapter({ cli });
   const cfg: FangConfig & { adapter: AgentAdapter } = {
-    cli: opts.cli ?? 'true',
+    cli,
     port: 0,
     adapter,
     name: 'fang-test',
@@ -107,48 +121,75 @@ async function boot(opts: {
   const server = createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const port = (server.address() as AddressInfo).port;
+
+  // The SDK's `DefaultRequestHandler` holds `taskStore` and `agentExecutor`
+  // as `private readonly` fields. At runtime they are ordinary properties
+  // — we access them via a narrow cast because we explicitly want to
+  // bypass `sendMessage` (see file header for why).
+  const internals = requestHandler as unknown as {
+    taskStore: BootedServer['_internals']['taskStore'];
+    agentExecutor: { events: BootedServer['_internals']['events'] };
+  };
+
   return {
     server,
     url: `http://127.0.0.1:${port}`,
     agentCard,
     requestHandler,
+    _internals: {
+      taskStore: internals.taskStore,
+      events: internals.agentExecutor.events,
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
 
-/** Build a v1.0.1 ServerCallContext for direct SDK calls. */
-function makeContext(): ServerCallContext {
-  return new ServerCallContextClass({});
+/** Save a task directly to the shared taskStore in the given state. */
+async function seedTask(booted: BootedServer, state: TaskState, overrides: Partial<Task> = {}): Promise<Task> {
+  const now = new Date().toISOString();
+  const defaultStatus = { state, message: undefined, timestamp: now };
+  const task: Task = {
+    id: overrides.id ?? randomUUID(),
+    contextId: overrides.contextId ?? randomUUID(),
+    status: defaultStatus,
+    artifacts: [],
+    history: [],
+    metadata: undefined,
+    ...overrides,
+  };
+  // The spread above lets callers override any field including `status`,
+  // but if they didn't we already set it via `defaultStatus`. Reset
+  // `status` to the default after the spread so it isn't accidentally
+  // overwritten by `overrides` keys that don't include it (defensive).
+  if (overrides.status === undefined) task.status = defaultStatus;
+  await booted._internals.taskStore.save(task);
+  return task;
 }
 
-/** Seed a task by invoking the SDK handler directly (bypasses JSON-RPC envelope). */
-async function seedTask(booted: BootedServer, text: string): Promise<Task> {
-  const result = await booted.requestHandler.sendMessage(
-    {
-      tenant: '',
-      message: {
-        messageId: randomUUID(),
-        role: 'user',
-        parts: [{ kind: 'text', text }],
+/** Append N synthetic events to the per-task SSE event log. */
+function seedEvents(booted: BootedServer, taskId: string, count: number): void {
+  for (let i = 0; i < count; i++) {
+    booted._internals.events.append(taskId, {
+      kind: 'artifact-update',
+      taskId,
+      contextId: 'seed-ctx',
+      artifact: {
+        artifactId: 'stdout',
+        name: 'output',
+        parts: [{ kind: 'text', text: `chunk-${i}` }],
       },
-      configuration: undefined,
-      metadata: undefined,
-    },
-    makeContext(),
-  );
-  // result can be a Message or a Task
-  if ('id' in result && result.id !== undefined) {
-    return result as Task;
+      append: i > 0,
+      lastChunk: i === count - 1,
+    });
   }
-  throw new Error(`sendMessage did not return a task: ${JSON.stringify(result)}`);
 }
 
-/** Wait until /tasks/:id reports the given terminal state. */
-async function waitForTerminalState(
+/** Wait until /tasks/:id reports one of the expected states. */
+async function waitForState(
   baseUrl: string,
   taskId: string,
   states: string[],
-  maxMs = 5000,
+  maxMs = 2000,
 ): Promise<{ id: string; status: { state: string } }> {
   const deadline = Date.now() + maxMs;
   let last: { id: string; status: { state: string } } | null = null;
@@ -159,10 +200,10 @@ async function waitForTerminalState(
       last = t;
       if (states.includes(t.status.state)) return t;
     }
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 25));
   }
   throw new Error(
-    `Task ${taskId} did not reach terminal state [${states.join(',')}] within ${maxMs}ms; last seen: ${JSON.stringify(last)}`,
+    `Task ${taskId} did not reach state [${states.join(',')}] within ${maxMs}ms; last seen: ${JSON.stringify(last)}`,
   );
 }
 
@@ -236,7 +277,7 @@ describe('GET /healthz (spec/01 alias)', () => {
 describe('GET /tasks/:id (spec/01 REST endpoint)', () => {
   let booted: BootedServer;
   beforeEach(async () => {
-    booted = await boot({ cli: 'true' });
+    booted = await boot();
   });
   afterEach(async () => {
     await booted.close();
@@ -249,15 +290,14 @@ describe('GET /tasks/:id (spec/01 REST endpoint)', () => {
     expect(body.error?.message).toMatch(/does-not-exist/);
   });
 
-  it('returns the persisted task after a request-handler submission', async () => {
-    const seeded = await seedTask(booted, 'hello fang');
+  it('returns the persisted task when one exists in the store', async () => {
+    const seeded = await seedTask(booted, TaskState.TASK_STATE_WORKING);
     const r = await fetch(`${booted.url}/tasks/${seeded.id}`);
     expect(r.status).toBe(200);
     const body = (await r.json()) as { id: string; contextId: string; status: { state: string } };
     expect(body.id).toBe(seeded.id);
-    expect(typeof body.contextId).toBe('string');
-    expect(['submitted', 'working', 'completed', 'failed', 'canceled', 'rejected', 'input-required'])
-      .toContain(body.status.state);
+    expect(body.contextId).toBe(seeded.contextId);
+    expect(body.status.state).toBe('working');
   });
 });
 
@@ -267,7 +307,7 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
   describe('404 for unknown task', () => {
     let booted: BootedServer;
     beforeEach(async () => {
-      booted = await boot({ cli: 'true' });
+      booted = await boot();
     });
     afterEach(async () => {
       await booted.close();
@@ -287,46 +327,53 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
   describe('409 for already-terminal task', () => {
     let booted: BootedServer;
     beforeEach(async () => {
-      // `true` exits 0 immediately, so the task reaches a terminal state.
-      booted = await boot({ cli: 'true' });
+      booted = await boot();
     });
     afterEach(async () => {
       await booted.close();
     });
 
-    it('returns 409 TASK_ALREADY_COMPLETED for a completed task', async () => {
-      const seeded = await seedTask(booted, 'finish now');
-      await waitForTerminalState(booted.url, seeded.id, ['completed', 'failed', 'canceled', 'rejected']);
+    it('returns 409 TASK_ALREADY_COMPLETED for a task in `completed` state', async () => {
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
-      // If the task settled into `failed`/`canceled`/`rejected` instead of
-      // `completed`, the 409 still applies (terminal state). We then check
-      // the response is well-formed.
       expect(r.status).toBe(409);
       const body = (await r.json()) as {
         error?: { code?: string; message?: string; details?: { state?: string } };
         task?: { id: string; status: { state: string } };
       };
       expect(body.error?.code).toBe('TASK_ALREADY_COMPLETED');
+      expect(body.error?.details?.state).toBe('completed');
       expect(body.task?.id).toBe(seeded.id);
-      expect(['completed', 'failed', 'canceled', 'rejected']).toContain(body.error?.details?.state);
+      expect(body.task?.status.state).toBe('completed');
+    });
+
+    it('returns 409 for a task in `canceled` state (cancel-after-cancel)', async () => {
+      // spec/07 says "already terminal" includes `canceled`; verify the
+      // route enforces the same gate on the cancel-on-cancel path.
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_CANCELED);
+
+      const r = await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
+      expect(r.status).toBe(409);
+      const body = (await r.json()) as {
+        error?: { code?: string; details?: { state?: string } };
+      };
+      expect(body.error?.code).toBe('TASK_ALREADY_COMPLETED');
+      expect(body.error?.details?.state).toBe('canceled');
     });
   });
 
   describe('200 transition: working → canceled', () => {
     let booted: BootedServer;
     beforeEach(async () => {
-      // `sleep 30` keeps the child process alive long enough to cancel.
-      booted = await boot({ cli: 'sleep 30' });
+      booted = await boot();
     });
     afterEach(async () => {
       await booted.close();
     });
 
     it('transitions a working task to canceled and returns 200 with the new state', async () => {
-      const seeded = await seedTask(booted, 'long running');
-      // Wait until the task is in a non-terminal state (working/submitted).
-      await waitForTerminalState(booted.url, seeded.id, ['submitted', 'working']);
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_WORKING);
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
       expect(r.status).toBe(200);
@@ -342,8 +389,7 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
     });
 
     it('persists the canceled state so subsequent GET reflects it', async () => {
-      const seeded = await seedTask(booted, 'cancel me');
-      await waitForTerminalState(booted.url, seeded.id, ['submitted', 'working']);
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_WORKING);
       await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}`);
@@ -359,26 +405,21 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
 describe('GET /tasks/:id/events SSE', () => {
   let booted: BootedServer;
   beforeEach(async () => {
-    booted = await boot({ cli: 'true' });
+    booted = await boot();
   });
   afterEach(async () => {
     await booted.close();
   });
 
   it('emits `event: end` immediately for a task already in a terminal state', async () => {
-    const seeded = await seedTask(booted, 'quick');
-    await waitForTerminalState(booted.url, seeded.id, [
-      'completed',
-      'failed',
-      'canceled',
-      'rejected',
-    ]);
+    const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
 
     const r = await fetch(`${booted.url}/tasks/${seeded.id}/events`);
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toContain('text/event-stream');
     const body = await readSseUntilEnd(r, 1500);
     expect(body).toMatch(/event: end/);
+    expect(body).toMatch(/"state":"completed"/);
   });
 
   it('returns 404 for an unknown task id', async () => {
@@ -387,19 +428,14 @@ describe('GET /tasks/:id/events SSE', () => {
   });
 
   it('honors Last-Event-ID header for resuming mid-stream', async () => {
-    const seeded = await seedTask(booted, 'sse resume');
-    await waitForTerminalState(booted.url, seeded.id, [
-      'completed',
-      'failed',
-      'canceled',
-      'rejected',
-    ]);
+    const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
+    seedEvents(booted, seeded.id, 5);
 
     // First pass: collect every event with its seq.
     const first = await fetch(`${booted.url}/tasks/${seeded.id}/events`);
     const firstBody = await readSseUntilEnd(first, 1500);
     const allSeqs = Array.from(firstBody.matchAll(/^id: (\d+)$/gm)).map((m) => Number(m[1]));
-    expect(allSeqs.length).toBeGreaterThan(0);
+    expect(allSeqs.length).toBe(5);
 
     // Pick a mid-stream seq and ask the server to resume from there.
     const resumeFrom = allSeqs[Math.floor(allSeqs.length / 2)]!;
@@ -417,20 +453,15 @@ describe('GET /tasks/:id/events SSE', () => {
   });
 
   it('honors ?from=N query parameter as an alternative resume cursor', async () => {
-    const seeded = await seedTask(booted, 'sse from query');
-    await waitForTerminalState(booted.url, seeded.id, [
-      'completed',
-      'failed',
-      'canceled',
-      'rejected',
-    ]);
+    const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
+    seedEvents(booted, seeded.id, 5);
 
     const first = await fetch(`${booted.url}/tasks/${seeded.id}/events`);
     const firstBody = await readSseUntilEnd(first, 1500);
     const allSeqs = Array.from(firstBody.matchAll(/^id: (\d+)$/gm)).map((m) => Number(m[1]));
-    expect(allSeqs.length).toBeGreaterThan(0);
+    expect(allSeqs.length).toBe(5);
 
-    const from = allSeqs[0]!; // resume from the first seq → expect no replays of seq ≤ from
+    const from = allSeqs[0]!; // resume from the first seq → no replays of seq ≤ from
     const resumed = await fetch(`${booted.url}/tasks/${seeded.id}/events?from=${from}`);
     expect(resumed.status).toBe(200);
     const resumedBody = await readSseUntilEnd(resumed, 1500);
@@ -446,13 +477,21 @@ describe('GET /tasks/:id/events SSE', () => {
 
 describe('Agent card v1.0 compliance', () => {
   describe('protocolVersion (spec/a2a-v1/MIGRATION-fangai.md #15)', () => {
-    it('advertises protocolVersion "1.0" (currently 0.3.0)', async () => {
+    it('advertises protocolVersion "1.0" on every supportedInterface (currently 0.3.0)', async () => {
       const booted = await boot();
       try {
-        // v1.0.1 of the SDK renamed the top-level `protocolVersion` to
-        // live on each AgentInterface inside `supportedInterfaces`. The
-        // migration requires "1.0" everywhere it appears.
-        expect(booted.agentCard.protocolVersion).toBe('1.0');
+        // v1.0.1 of the SDK dropped the top-level `protocolVersion` field
+        // and moved it onto each AgentInterface inside `supportedInterfaces`.
+        // The migration requires "1.0" on every interface. We also assert
+        // the top-level field is absent so a future regression to the v0.3
+        // shape is caught.
+        const card = booted.agentCard as Record<string, unknown>;
+        expect(card.protocolVersion).toBeUndefined();
+        expect(Array.isArray(booted.agentCard.supportedInterfaces)).toBe(true);
+        expect(booted.agentCard.supportedInterfaces.length).toBeGreaterThan(0);
+        for (const i of booted.agentCard.supportedInterfaces) {
+          expect(i.protocolVersion).toBe('1.0');
+        }
       } finally {
         await booted.close();
       }
@@ -465,18 +504,15 @@ describe('Agent card v1.0 compliance', () => {
         expect(r.status).toBe(200);
         const card = (await r.json()) as {
           protocolVersion?: string;
-          supportedInterfaces?: Array<{ protocolVersion?: string }>;
+          supportedInterfaces?: Array<{ protocolBinding?: string; protocolVersion?: string }>;
         };
-        // Acceptable places to find the protocolVersion string:
-        //   - top-level `protocolVersion` (compat shape), OR
-        //   - inside every supportedInterfaces[*].protocolVersion (v1.0.1)
-        const onInterfaces = (card.supportedInterfaces ?? []).every((i) => i.protocolVersion === '1.0');
-        const onTopLevel = card.protocolVersion === '1.0';
-        expect(onTopLevel || onInterfaces).toBe(true);
-        if (card.supportedInterfaces !== undefined) {
-          for (const i of card.supportedInterfaces) {
-            expect(i.protocolVersion).toBe('1.0');
-          }
+        // v1.0 wire shape: top-level `protocolVersion` MUST NOT appear, and
+        // every supportedInterfaces[*] MUST advertise protocolVersion '1.0'.
+        expect(card.protocolVersion).toBeUndefined();
+        expect(Array.isArray(card.supportedInterfaces)).toBe(true);
+        expect(card.supportedInterfaces!.length).toBeGreaterThan(0);
+        for (const i of card.supportedInterfaces!) {
+          expect(i.protocolVersion).toBe('1.0');
         }
       } finally {
         await booted.close();
@@ -497,8 +533,11 @@ describe('Agent card v1.0 compliance', () => {
           security?: unknown;
         };
         expect(card.securitySchemes ?? {}).toEqual({});
+        // v1.0 wire shape: `security` (v0.3) MUST NOT appear; only the
+        // renamed `securityRequirements` (which is also empty when no auth
+        // is configured) is valid.
+        expect(card.security).toBeUndefined();
         expect(card.securityRequirements ?? []).toEqual([]);
-        expect(card.security ?? []).toEqual([]);
       } finally {
         await booted.close();
       }
@@ -520,15 +559,16 @@ describe('Agent card v1.0 compliance', () => {
         expect(typeof card.securitySchemes).toBe('object');
         expect(Object.keys(card.securitySchemes!).length).toBeGreaterThan(0);
 
-        // The v1.0.1 rename: `security` → `securityRequirements`.
-        // Spec compliance requires securityRequirements to be present and
-        // non-empty when auth is required.
-        const reqs = card.securityRequirements ?? card.security;
-        expect(Array.isArray(reqs)).toBe(true);
-        expect(reqs!.length).toBeGreaterThan(0);
+        // The v1.0.1 rename: `security` → `securityRequirements`. v0.3's
+        // top-level `security` MUST NOT appear on the wire — it's a hidden
+        // legacy field now that v0.3 clients are served via toCompatAgentCard
+        // (see spec/01 + MIGRATION-fangai.md row #2).
+        expect(card.security).toBeUndefined();
+        expect(Array.isArray(card.securityRequirements)).toBe(true);
+        expect(card.securityRequirements!.length).toBeGreaterThan(0);
         // Every requirement must reference an existing scheme.
         const schemeNames = Object.keys(card.securitySchemes!);
-        for (const req of reqs!) {
+        for (const req of card.securityRequirements!) {
           for (const name of Object.keys(req)) {
             expect(schemeNames).toContain(name);
           }
