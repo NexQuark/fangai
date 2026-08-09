@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { TaskState } from '@a2a-js/sdk';
+import { Role, TaskState } from '@a2a-js/sdk';
 import type { AgentExecutor, RequestContext, ExecutionEventBus, ServerCallContext } from '@a2a-js/sdk/server';
 
 /** A no-op ServerCallContext for REST endpoints that aren't invoked through
@@ -27,6 +27,44 @@ import {
 import { CursorAgentAdapter, CursorSessionStore, type CursorSession } from './cursor-adapter.ts';
 import { FangTaskStore } from './fang-task-store.ts';
 import { TaskEventStore } from './task-event-store.ts';
+
+/** Build a v1.0 text Part ({content: {$case: 'text', value}}). The v1.0 SDK
+ *  only accepts this discriminated shape for parts on the wire — the legacy
+ *  v0.3 {kind: 'text', text} form is what the compat layer TRANSLATES, not
+ *  what we publish. */
+function textPart(text: string): { content: { $case: 'text'; value: string }; filename: string; mediaType: string } {
+  return { content: { $case: 'text', value: text }, filename: '', mediaType: '' };
+}
+
+/**
+ * Complete v1.0 agent Message. The legacyCompat translator's
+ * toCompatMessage() reads `extensions.length` and `referenceTaskIds.length`
+ * via nonEmptyArray(), so omitting them (or metadata) makes the response
+ * conversion throw on undefined. Always publish fully-formed messages.
+ */
+function agentMessage(contextId: string, taskId: string, text: string): {
+  messageId: string;
+  contextId: string;
+  taskId: string;
+  role: Role;
+  parts: ReturnType<typeof textPart>[];
+  metadata: Record<string, never>;
+  extensions: never[];
+  referenceTaskIds: never[];
+} {
+  return {
+    messageId: randomUUID(),
+    contextId,
+    taskId,
+    // v1.0 Role is a numeric enum (ROLE_AGENT = 2); publishing the string
+    // 'agent' makes Message.toJSON serialize it as "UNRECOGNIZED".
+    role: Role.ROLE_AGENT,
+    parts: [textPart(text)],
+    metadata: {},
+    extensions: [],
+    referenceTaskIds: [],
+  };
+}
 
 // ─── BridgeExecutor ────────────────────────────────────────────────────────
 
@@ -85,21 +123,39 @@ export class BridgeExecutor implements AgentExecutor {
     const taskId = ctx.taskId;
     const contextId = ctx.contextId;
     this.tapBus(bus, taskId);
+    this.contextByTaskId.set(taskId, contextId);
 
-    // Extract user text
+    // Seed the ResultManager with a working task FIRST — every subsequent
+    // statusUpdate / artifactUpdate / message must reference a task that is
+    // already known to the task store, or ResultManager.currentTask stays
+    // null and the SDK fails the request with "no task context found".
+    this.pub(bus, 'task', {
+      id: taskId,
+      contextId,
+      status: { state: TaskState.TASK_STATE_WORKING, timestamp: new Date().toISOString() },
+      history: [],
+      artifacts: [],
+      metadata: {},
+    });
+
+    // Extract user text. The v1.0 SDK always hands us v1.0-shaped parts
+    // ({content: {$case: 'text', value}}), but accept the legacy v0.3
+    // shape ({kind: 'text', text}) too so bridge callers stay tolerant.
     const parts = ctx.userMessage.parts ?? [];
-    const text = (parts as Array<{ kind?: string; text?: string }>)
-      .filter(p => p.kind === 'text' && typeof p.text === 'string')
-      .map(p => p.text!)
+    const text = (parts as Array<{ kind?: string; text?: string; content?: { $case?: string; value?: string } }>)
+      .map(p => {
+        if (p.content?.$case === 'text' && typeof p.content.value === 'string') return p.content.value;
+        if (p.kind === 'text' && typeof p.text === 'string') return p.text;
+        return '';
+      })
+      .filter(Boolean)
       .join('\n').trim();
 
     if (!text) {
-      this.publishMessage(bus, taskId, contextId, 'No message text provided.', 'rejected');
+      this.publishMessage(bus, taskId, contextId, 'No message text provided.', TaskState.TASK_STATE_REJECTED);
       bus.finished();
       return;
     }
-
-    this.contextByTaskId.set(taskId, contextId);
 
     const task = { id: taskId, message: text, context: { workdir: this.config.workdir } };
 
@@ -116,15 +172,8 @@ export class BridgeExecutor implements AgentExecutor {
     const adapter = this.adapter;
     const timeout = config.taskTimeout ?? 300;
 
-    // Seed the ResultManager with a task event so it can track this execution.
-    // Without this, status-update/artifact-update events reference an unknown taskId
-    // and ResultManager.currentTask stays null → "no task context found" on completion.
-    this.pub(bus, 'task', {
-      id: taskId,
-      contextId,
-      status: { state: 'working', timestamp: new Date().toISOString() },
-      history: [],
-    });
+    // The working-task seed happens in execute() so every outcome path
+    // (including the empty-text early return) has a known task.
 
     const [cmd, ...cliArgs] = this.splitCli(config.cli);
     const extraArgs = adapter.buildArgs(task, config);
@@ -152,7 +201,7 @@ export class BridgeExecutor implements AgentExecutor {
               accumulated += ev.text;
               this.pub(bus, 'artifactUpdate', {
                 taskId, contextId,
-                artifact: { artifactId: 'stdout', name: 'output', parts: [{ kind: 'text', text: ev.text }] },
+                artifact: { artifactId: 'stdout', name: 'output', parts: [textPart(ev.text)] },
                 append: true, lastChunk: false,
               });
             }
@@ -160,13 +209,7 @@ export class BridgeExecutor implements AgentExecutor {
               settled = true;
               clearTimeout(timer);
               this.forgetTrackedTask(taskId);
-              this.pub(bus, 'message', {
-                messageId: randomUUID(),
-                contextId,
-                taskId,
-                role: 'agent',
-                parts: [{ kind: 'text', text: accumulated || 'Done' }],
-              });
+              this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || 'Done'));
               bus.finished();
               resolve();
             }
@@ -177,15 +220,8 @@ export class BridgeExecutor implements AgentExecutor {
               this.pub(bus, 'statusUpdate', {
                 taskId, contextId,
                 status: {
-                  state: 'failed',
-                  message: {
-                    kind: 'message',
-                    messageId: randomUUID(),
-                    contextId,
-                    taskId,
-                    role: 'agent',
-                    parts: [{ kind: 'text', text: ev.message }],
-                  },
+                  state: TaskState.TASK_STATE_FAILED,
+                  message: agentMessage(contextId, taskId, ev.message),
                   timestamp: new Date().toISOString(),
                 },
               });
@@ -197,7 +233,7 @@ export class BridgeExecutor implements AgentExecutor {
         onError: (text) => {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: { artifactId: 'stderr', name: 'errors', parts: [{ kind: 'text', text }] },
+            artifact: { artifactId: 'stderr', name: 'errors', parts: [textPart(text)] },
           });
         },
         onExit: (code) => {
@@ -206,22 +242,10 @@ export class BridgeExecutor implements AgentExecutor {
           settled = true;
           if (code === 0) {
             this.forgetTrackedTask(taskId);
-            this.pub(bus, 'message', {
-              messageId: randomUUID(),
-              contextId,
-              taskId,
-              role: 'agent',
-              parts: [{ kind: 'text', text: accumulated || '(no output)' }],
-            });
+            this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || '(no output)'));
           } else {
             this.forgetTrackedTask(taskId);
-            this.pub(bus, 'message', {
-              messageId: randomUUID(),
-              contextId,
-              taskId,
-              role: 'agent',
-              parts: [{ kind: 'text', text: `Error: exit code ${code}` }],
-            });
+            this.pub(bus, 'message', agentMessage(contextId, taskId, `Error: exit code ${code}`));
           }
           bus.finished();
           resolve();
@@ -238,13 +262,7 @@ export class BridgeExecutor implements AgentExecutor {
     const adapter = this.adapter;
     const timeout = config.taskTimeout ?? 600;
 
-    // Seed ResultManager — same reason as executeOneshot
-    this.pub(bus, 'task', {
-      id: taskId,
-      contextId,
-      status: { state: 'working', timestamp: new Date().toISOString() },
-      history: [],
-    });
+    // The working-task seed happens in execute() (shared with executeOneshot).
 
     // Ensure persistent process is running
     if (!this.persistent) {
@@ -264,20 +282,28 @@ export class BridgeExecutor implements AgentExecutor {
 
     await this.attachPersistentHooks();
 
-    let accumulated = '';
-    let settled = false;
+    // The SDK's ResultManager drains the task's event bus until it sees a
+    // terminal event OR until execute() resolves and the SDK calls
+    // bus.finished(). We therefore must NOT resolve this promise until the
+    // task reaches a terminal state (message / error / timeout) — otherwise
+    // the bus closes early and the final message event is silently dropped,
+    // leaving the caller with a half-finished "working" task.
+    return new Promise<void>((resolve) => {
+      let accumulated = '';
+      let settled = false;
 
-    // Timeout guard
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      this.persistent!.removeLineHandler(taskId);
-      this.publishMessage(bus, taskId, contextId, `Task timed out after ${timeout}s`);
-      bus.finished();
-    }, timeout * 1000);
+      // Timeout guard
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.persistent!.removeLineHandler(taskId);
+        this.publishMessage(bus, taskId, contextId, `Task timed out after ${timeout}s`);
+        bus.finished();
+        resolve();
+      }, timeout * 1000);
 
-    // Register per-task line handler — routes stdout to THIS task's bus
-    this.persistent.setLineHandler(taskId, (line: string) => {
+      // Register per-task line handler — routes stdout to THIS task's bus
+      this.persistent!.setLineHandler(taskId, (line: string) => {
       if (settled) return;
       const events = adapter.parseLine(line);
       for (const ev of events) {
@@ -288,7 +314,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: ev.type === 'thinking' ? 'pi-thinking' : 'stdout',
               name: ev.type === 'thinking' ? 'thinking' : 'output',
-              parts: [{ kind: 'text', text: ev.text }],
+              parts: [textPart(ev.text)],
             },
             append: true, lastChunk: false,
           });
@@ -299,7 +325,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: 'pi-agent-tool-call',
               name: 'tool-call',
-              parts: [{ kind: 'text', text: `[${ev.tool}] ${JSON.stringify(ev.input ?? {})}` }],
+              parts: [textPart(`[${ev.tool}] ${JSON.stringify(ev.input ?? {})}`)],
             },
             append: true, lastChunk: false,
           });
@@ -310,7 +336,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: 'pi-agent-tool-result',
               name: 'tool-result',
-              parts: [{ kind: 'text', text: `${ev.tool}: ${ev.output}` }],
+              parts: [textPart(`${ev.tool}: ${ev.output}`)],
             },
             append: true, lastChunk: false,
           });
@@ -322,7 +348,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: `pi-protocol-${ev.subtype}`,
               name: `pi-protocol/${ev.subtype}`,
-              parts: [{ kind: 'text', text: `[pi] ${ev.subtype}${detail}` }],
+              parts: [textPart(`[pi] ${ev.subtype}${detail}`)],
             },
             append: true,
             lastChunk: false,
@@ -334,10 +360,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: 'pi-host-tool-request',
               name: `host-tool/${ev.tool}`,
-              parts: [{
-                kind: 'text',
-                text: `[host_tool_call id=${ev.requestId}] ${ev.tool} ${JSON.stringify(ev.input)}`,
-              }],
+              parts: [textPart(`[host_tool_call id=${ev.requestId}] ${ev.tool} ${JSON.stringify(ev.input)}`)],
             },
             append: true, lastChunk: false,
           });
@@ -348,10 +371,7 @@ export class BridgeExecutor implements AgentExecutor {
             artifact: {
               artifactId: 'pi-host-tool-cancel',
               name: 'host-tool-cancel',
-              parts: [{
-                kind: 'text',
-                text: `[host_tool_cancel] cancelId=${ev.cancelId} target=${ev.targetRequestId}`,
-              }],
+              parts: [textPart(`[host_tool_cancel] cancelId=${ev.cancelId} target=${ev.targetRequestId}`)],
             },
             append: true, lastChunk: false,
           });
@@ -361,21 +381,16 @@ export class BridgeExecutor implements AgentExecutor {
           clearTimeout(timer);
           // Publish final message for sync clients
           this.forgetTrackedTask(taskId);
-          this.pub(bus, 'message', {
-            messageId: randomUUID(),
-            contextId,
-            taskId,
-            role: 'agent',
-            parts: [{ kind: 'text', text: accumulated || 'Done' }],
-          });
+          this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || 'Done'));
           bus.finished();
           // Clean up handler after completion
           this.persistent!.removeLineHandler(taskId);
+          resolve();
         }
         if (ev.type === 'status' && ev.state === 'working') {
           this.pub(bus, 'statusUpdate', {
             taskId, contextId,
-            status: { state: 'working', timestamp: new Date().toISOString() },
+            status: { state: TaskState.TASK_STATE_WORKING, timestamp: new Date().toISOString() },
           });
         }
         if (ev.type === 'error') {
@@ -385,26 +400,21 @@ export class BridgeExecutor implements AgentExecutor {
           this.pub(bus, 'statusUpdate', {
             taskId, contextId,
             status: {
-              state: 'failed',
-              message: {
-                kind: 'message',
-                messageId: randomUUID(),
-                contextId,
-                taskId,
-                role: 'agent',
-                parts: [{ kind: 'text', text: ev.message }],
-              },
+              state: TaskState.TASK_STATE_FAILED,
+              message: agentMessage(contextId, taskId, ev.message),
               timestamp: new Date().toISOString(),
             },
           });
           bus.finished();
           this.persistent!.removeLineHandler(taskId);
+          resolve();
         }
       }
-    });
+      });
 
-    // Deferred until this task owns Pi's stdin (`writeWhenActive` buffers if still queued).
-    this.persistent.writeWhenActive(taskId, adapter.formatInput(task));
+      // Deferred until this task owns Pi's stdin (`writeWhenActive` buffers if still queued).
+      this.persistent!.writeWhenActive(taskId, adapter.formatInput(task));
+    });
   }
 
   /**
@@ -441,30 +451,13 @@ export class BridgeExecutor implements AgentExecutor {
       this.persistent.removeLineHandler(taskId);
     }
 
-    const messageId = randomUUID();
-    const cancelMessage =
-      cid !== ''
-        ? {
-            kind: 'message' as const,
-            role: 'agent' as const,
-            messageId,
-            contextId: cid,
-            taskId,
-            parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
-          }
-        : {
-            kind: 'message' as const,
-            role: 'agent' as const,
-            messageId,
-            taskId,
-            parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
-          };
+    const cancelMessage = agentMessage(cid, taskId, 'Task canceled by client.');
 
     this.pub(bus, 'statusUpdate', {
       taskId,
       contextId: cid !== '' ? cid : taskId,
       status: {
-        state: 'canceled',
+        state: TaskState.TASK_STATE_CANCELED,
         message: cancelMessage,
         timestamp: new Date().toISOString(),
       },
@@ -496,20 +489,13 @@ export class BridgeExecutor implements AgentExecutor {
 
   // ─── Helpers ───────────────────────────────────────────────────────────
 
-  private publishMessage(bus: ExecutionEventBus, taskId: string, contextId: string, text: string, state: 'failed' | 'rejected' = 'failed') {
+  private publishMessage(bus: ExecutionEventBus, taskId: string, contextId: string, text: string, state: TaskState = TaskState.TASK_STATE_FAILED) {
     this.forgetTrackedTask(taskId);
     this.pub(bus, 'statusUpdate', {
       taskId, contextId,
       status: {
         state,
-        message: {
-          kind: 'message',
-          messageId: randomUUID(),
-          contextId,
-          taskId,
-          role: 'agent',
-          parts: [{ kind: 'text', text }],
-        },
+        message: agentMessage(contextId, taskId, text),
         timestamp: new Date().toISOString(),
       },
     });
@@ -568,15 +554,20 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
   const baseUrl = process.env.FANG_PUBLIC_URL ?? `http://localhost:${port}`;
   const agentCard = {
     ...agentCardBase,
-    // Two v1.0 interfaces (HTTP+JSON REST + JSONRPC) plus a v0.3 entry so the
+    // Two v1.0 interfaces (HTTP+JSON REST + JSONRPC) plus v0.3 entries so the
     // SDK's legacyCompat layer can serve the v0.3-shaped card (via
     // toCompatAgentCard) when a v0.3 client requests it with
     // A2A-Version: 0.3 (or no header — default is 0.3). Without the v0.3
-    // entry, legacyCompat returns 400 VERSION_NOT_SUPPORTED.
+    // entries, legacyCompat returns 400 VERSION_NOT_SUPPORTED. One v0.3
+    // entry per binding is required: the JSONRPC legacy handler and the
+    // legacy REST router both call validateVersion() with their binding
+    // (JSONRPC / HTTP+JSON), which filters supportedInterfaces by
+    // protocolBinding before checking the version.
     supportedInterfaces: [
       { url: `${baseUrl}/a2a/jsonrpc`, protocolBinding: 'JSONRPC',    protocolVersion: '1.0', tenant: '' },
       { url: `${baseUrl}/a2a/rest`,   protocolBinding: 'HTTP+JSON', protocolVersion: '1.0', tenant: '' },
       { url: baseUrl,                 protocolBinding: 'JSONRPC',    protocolVersion: '0.3', tenant: '' },
+      { url: `${baseUrl}/a2a/rest`,   protocolBinding: 'HTTP+JSON', protocolVersion: '0.3', tenant: '' },
     ],
     // Required in v1.0 (was optional in v0.3). Empty array is the spec-
     // compliant way to say "no JWS signatures on this card yet"; signing
@@ -595,8 +586,19 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
     // Required in v1.0. Empty map when no auth is configured; bearer
     // scheme advertised only when an --api-key is set so unauthenticated
     // deployments stay free of misleading auth hints.
+    // v1.0 SecurityScheme is a discriminated union {$case, value}; the
+    // legacyCompat layer (toCompatSecurityScheme) reads `scheme.$case` and
+    // throws "Unsupported SecurityScheme $case: unknown" on the old v0.3
+    // {type, scheme} shape.
     securitySchemes: config.apiKey
-      ? { bearer: { type: 'http', scheme: 'bearer' } }
+      ? {
+          bearer: {
+            scheme: {
+              $case: 'httpAuthSecurityScheme',
+              value: { description: '', scheme: 'Bearer', bearerFormat: '' },
+            },
+          },
+        }
       : {},
     // Required in v1.0. Empty array by default; populated only when
     // --api-key is configured (replaces v0.3's `security: [{ ... }]`).
@@ -786,14 +788,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
           const pp = executor['persistent'] as PersistentProcess | null;
           if (pp) pp.removeLineHandler(taskId);
 
-          const cancelMessage = {
-            kind: 'message' as const,
-            role: 'agent' as const,
-            messageId: randomUUID(),
-            contextId: existing.contextId,
-            taskId,
-            parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
-          };
+          const cancelMessage = agentMessage(existing.contextId, taskId, 'Task canceled by client.');
           const canceledStatus = {
             state: TaskState.TASK_STATE_CANCELED as typeof TaskState.TASK_STATE_CANCELED,
             message: cancelMessage,
@@ -873,16 +868,24 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
             for (const entry of live) {
               writeEntry(entry);
               lastSeq = entry.seq;
-              const k = (entry.event as { kind: string }).kind;
-              if (k === 'status-update') {
-                const final = (entry.event as { final?: boolean }).final;
-                const state = (entry.event as { status?: { state?: string } }).status?.state;
-                if (final && state && ['completed', 'failed', 'canceled', 'rejected'].includes(state)) {
-                  clearInterval(interval);
-                  res.write(`event: end\ndata: {"state":"${state}"}\n\n`);
-                  res.end();
-                  return;
-                }
+              // v1.0 events are {kind, data} envelopes; kind is 'statusUpdate'
+              // (the v0.3 'status-update' name is only used on the legacy wire).
+              const ev = entry.event as {
+                kind: string;
+                data?: { status?: { state?: unknown } };
+              };
+              const state = ev.data?.status?.state;
+              if (
+                ev.kind === 'statusUpdate'
+                && (state === TaskState.TASK_STATE_COMPLETED
+                  || state === TaskState.TASK_STATE_FAILED
+                  || state === TaskState.TASK_STATE_CANCELED
+                  || state === TaskState.TASK_STATE_REJECTED)
+              ) {
+                clearInterval(interval);
+                res.write(`event: end\ndata: {"state":"${String(state)}"}\n\n`);
+                res.end();
+                return;
               }
             }
           }, 250);
