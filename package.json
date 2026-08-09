@@ -28,13 +28,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@a2a-js/sdk": "^0.3.13",
+    "@a2a-js/sdk": "^1.0.0",
     "commander": "^13.1.0",
     "express": "^4.22.1",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
-    "@fangai/pi": "workspace:*",
     "@types/express": "^5.0.6",
     "@types/node": "^22.19.17",
     "typescript": "^5.4.0",

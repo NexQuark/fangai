@@ -2,6 +2,9 @@ packages:
   - "packages/*"
   - "packages/adapters/*"
 
+allowBuilds:
+  esbuild: set this to true or false
+
 # Install optional native bindings (e.g. Rollup/Vite) for these platforms so the same
 # node_modules works under Windows and WSL/Linux (optional deps default to host-only).
 supportedArchitectures:

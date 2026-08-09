@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@a2a-js/sdk':
-        specifier: ^0.3.13
-        version: 0.3.13(express@4.22.1)
+        specifier: ^1.0.0
+        version: 1.0.1(express@4.22.1)
       commander:
         specifier: ^13.1.0
         version: 13.1.0
@@ -21,9 +21,6 @@ importers:
         specifier: ^2.8.3
         version: 2.8.3
     devDependencies:
-      '@fangai/pi':
-        specifier: workspace:*
-        version: link:packages/pi
       '@types/express':
         specifier: ^5.0.6
         version: 5.0.6
@@ -38,10 +35,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/aider:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -51,10 +44,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/claude:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -64,10 +53,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/codex:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -77,10 +62,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/cursor:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -90,10 +71,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/generic:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -103,10 +80,6 @@ importers:
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
   packages/adapters/opencode:
-    dependencies:
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../../core
     devDependencies:
       typescript:
         specifier: ^5.4.0
@@ -120,9 +93,6 @@ importers:
       '@fangai/client':
         specifier: workspace:*
         version: link:../client
-      '@fangai/core':
-        specifier: workspace:*
-        version: link:../core
       commander:
         specifier: ^12.0.0
         version: 12.1.0
@@ -146,8 +116,8 @@ importers:
   packages/client:
     dependencies:
       '@a2a-js/sdk':
-        specifier: ^0.3.13
-        version: 0.3.13(express@4.22.1)
+        specifier: ^1.0.0
+        version: 1.0.1(express@4.22.1)
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -159,15 +129,11 @@ importers:
         specifier: ^3.0.0
         version: 3.2.4(@types/node@22.19.17)(yaml@2.8.3)
 
-  packages/core: {}
-
-  packages/pi: {}
-
 packages:
 
-  '@a2a-js/sdk@0.3.13':
-    resolution: {integrity: sha512-BZr0f9JVNQs3GKOM9xINWCh6OKIJWZFPyqqVqTym5mxO2Eemc6I/0zL7zWnljHzGdaf5aZQyQN5xa6PSH62q+A==}
-    engines: {node: '>=18'}
+  '@a2a-js/sdk@1.0.1':
+    resolution: {integrity: sha512-CJQdh3Wzwo8qIx5UUkSJ7+7BEI16PB+MXMHHNSmx8JQsQed2HlQgvx1ENOiKUfYA3PlcEvxIwv14dBblhDuPmw==}
+    engines: {node: '>=20'}
     peerDependencies:
       '@bufbuild/protobuf': ^2.10.2
       '@grpc/grpc-js': ^1.11.0
@@ -752,6 +718,9 @@ packages:
     resolution: {integrity: sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==}
     engines: {node: '>= 0.10'}
 
+  jose@6.2.8:
+    resolution: {integrity: sha512-Bsdjwm3Qsd/P0jR+BHDe3LytDfY7WBq2HmCCLIwuVRHMuEC9ae7/R474GIUdF1NgCyZjzVo/A9DOiOBtXq8ZoQ==}
+
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
 
@@ -1057,8 +1026,9 @@ packages:
 
 snapshots:
 
-  '@a2a-js/sdk@0.3.13(express@4.22.1)':
+  '@a2a-js/sdk@1.0.1(express@4.22.1)':
     dependencies:
+      jose: 6.2.8
       uuid: 11.1.0
     optionalDependencies:
       express: 4.22.1
@@ -1551,6 +1521,8 @@ snapshots:
   inherits@2.0.4: {}
 
   ipaddr.js@1.9.1: {}
+
+  jose@6.2.8: {}
 
   js-tokens@9.0.1: {}
 

@@ -20,7 +20,7 @@
     "prepublishOnly": "tsc"
   },
   "dependencies": {
-    "@a2a-js/sdk": "^0.3.13"
+    "@a2a-js/sdk": "^1.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
