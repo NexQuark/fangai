@@ -1,16 +1,16 @@
 /**
  * In-memory A2A TaskStore — bounded LRU + TTL cleanup for completed terminal tasks.
- * Matches @a2a-js/sdk TaskStore: save/load only.
+ * Implements @a2a-js/sdk@1.0.1 TaskStore: save / load / list.
  */
 
-import type { Task } from '@a2a-js/sdk';
+import type { ListTasksRequest, ListTasksResponse, Task, TaskState } from '@a2a-js/sdk';
 import type { TaskStore, ServerCallContext } from '@a2a-js/sdk/server';
 
-const TERMINAL_STATES = new Set<string>([
-  'completed',
-  'failed',
-  'canceled',
-  'rejected',
+const TERMINAL_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
+  'completed' as TaskState,
+  'failed' as TaskState,
+  'canceled' as TaskState,
+  'rejected' as TaskState,
 ]);
 
 interface StoredEntry {
@@ -28,6 +28,10 @@ function shallowCloneTask(task: Task): Task {
     t.artifacts = t.artifacts.map(a => ({ ...a }));
   }
   return t;
+}
+
+function isTerminal(state: TaskState | undefined): boolean {
+  return state !== undefined && TERMINAL_STATES.has(state);
 }
 
 export interface FangTaskStoreOptions {
@@ -52,15 +56,15 @@ export class FangTaskStore implements TaskStore {
     this.retentionMs = Math.max(1, mins) * 60 * 1000;
   }
 
-  async save(task: Task, _context?: ServerCallContext): Promise<void> {
+  async save(task: Task, _context: ServerCallContext): Promise<void> {
     const cloned = shallowCloneTask(task);
     const now = Date.now();
-    const terminal = TERMINAL_STATES.has(cloned.status.state);
+    const terminal = isTerminal(cloned.status?.state);
 
     let terminalSinceMs: number | null = null;
     if (terminal) {
       const prev = this.entries.get(cloned.id);
-      if (prev && prev.terminalSinceMs !== null && TERMINAL_STATES.has(prev.task.status.state)) {
+      if (prev && isTerminal(prev.task.status?.state) && prev.terminalSinceMs !== null) {
         terminalSinceMs = prev.terminalSinceMs;
       } else {
         terminalSinceMs = now;
@@ -76,7 +80,7 @@ export class FangTaskStore implements TaskStore {
     return Promise.resolve();
   }
 
-  async load(taskId: string, _context?: ServerCallContext): Promise<Task | undefined> {
+  async load(taskId: string, _context: ServerCallContext): Promise<Task | undefined> {
     const wrap = this.entries.get(taskId);
     if (!wrap) {
       return Promise.resolve(undefined);
@@ -88,6 +92,21 @@ export class FangTaskStore implements TaskStore {
     };
     this.entries.set(taskId, entry);
     return Promise.resolve(shallowCloneTask(entry.task));
+  }
+
+  /**
+   * v1.0 new method: list tasks with optional filtering and pagination.
+   * Fangai is single-tenant + in-memory, so context filtering is a no-op.
+   * The SDK only reads `result.tasks` and `result.nextPageToken`; we always
+   * return the full set with no token (pagination can be added later if
+   * the LRU size grows past a single response payload).
+   */
+  async list(_params: ListTasksRequest, _context: ServerCallContext): Promise<ListTasksResponse> {
+    const tasks: Task[] = [];
+    for (const ent of this.entries.values()) {
+      tasks.push(shallowCloneTask(ent.task));
+    }
+    return Promise.resolve({ tasks, nextPageToken: '' } as unknown as ListTasksResponse);
   }
 
   /** Remove one task ID (Fang extension — not part of SDK TaskStore). */
@@ -103,7 +122,7 @@ export class FangTaskStore implements TaskStore {
     const now = Date.now();
     for (const [id, ent] of this.entries) {
       if (
-        TERMINAL_STATES.has(ent.task.status.state) &&
+        isTerminal(ent.task.status?.state) &&
         ent.terminalSinceMs !== null &&
         now - ent.terminalSinceMs > this.retentionMs
       ) {
@@ -117,7 +136,7 @@ export class FangTaskStore implements TaskStore {
       let victim: string | undefined;
       for (const id of this.entries.keys()) {
         const ent = this.entries.get(id);
-        if (ent && TERMINAL_STATES.has(ent.task.status.state)) {
+        if (ent && isTerminal(ent.task.status?.state)) {
           victim = id;
           break;
         }

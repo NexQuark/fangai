@@ -581,7 +581,11 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       : {},
     // Required in v1.0. Empty array by default; populated only when
     // --api-key is configured (replaces v0.3's `security: [{ ... }]`).
-    securityRequirements: config.apiKey ? [{ bearer: [] }] : [],
+    // SecurityRequirement is a {schemes: {name: StringList}} wrapper per
+    // v1.0, where StringList itself is {list: string[]}.
+    securityRequirements: config.apiKey
+      ? [{ schemes: { bearer: { list: [] } } }]
+      : [],
   };
 
   const executor = new BridgeExecutor(adapter, { ...rest, port });
@@ -732,13 +736,16 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
               error: { code: 'TASK_NOT_FOUND', message: `Task ${taskId} not found`, details: { taskId } },
             });
           }
-          const terminal = ['completed', 'failed', 'canceled', 'rejected'].includes(existing.status.state);
+          // v1.0 SDK types Task.status as TaskStatus | undefined, so guard explicitly.
+          const currentState = existing.status?.state;
+          const terminal = currentState !== undefined
+            && ['completed', 'failed', 'canceled', 'rejected'].includes(currentState);
           if (terminal) {
             return res.status(409).json({
               error: {
                 code: 'TASK_ALREADY_COMPLETED',
-                message: `Task ${taskId} is already in terminal state ${existing.status.state}`,
-                details: { taskId, state: existing.status.state },
+                message: `Task ${taskId} is already in terminal state ${currentState}`,
+                details: { taskId, state: currentState },
               },
               task: existing,
             });
@@ -765,16 +772,18 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
             timestamp: new Date().toISOString(),
           };
           const canceledTask = { ...existing, status: canceledStatus };
-          await taskStore.save(canceledTask);
+          await taskStore.save(canceledTask, {} as Parameters<typeof taskStore.save>[1]);
 
           // Record into the per-task event store so SSE subscribers see it.
+          // v1.0 envelope: {kind: 'statusUpdate', data: {...}}.
           executor.events.append(taskId, {
-            kind: 'status-update',
-            taskId,
-            contextId: existing.contextId,
-            final: true,
-            status: canceledStatus,
-          });
+            kind: 'statusUpdate',
+            data: {
+              taskId,
+              contextId: existing.contextId,
+              status: canceledStatus,
+            },
+          } as Parameters<typeof executor.events.append>[1]);
 
           res.status(200).json(canceledTask);
         } catch (err) {
@@ -816,9 +825,12 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
 
           for (const entry of executor.events.read(taskId, fromSeq)) writeEntry(entry);
 
-          const terminal = ['completed', 'failed', 'canceled', 'rejected'].includes(task.status.state);
+          // v1.0 SDK types Task.status as TaskStatus | undefined, so guard explicitly.
+          const currentState = task.status?.state;
+          const terminal = currentState !== undefined
+            && ['completed', 'failed', 'canceled', 'rejected'].includes(currentState);
           if (terminal) {
-            res.write(`event: end\ndata: {"state":"${task.status.state}"}\n\n`);
+            res.write(`event: end\ndata: {"state":"${currentState}"}\n\n`);
             res.end();
             return;
           }
