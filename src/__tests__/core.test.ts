@@ -309,6 +309,38 @@ describe('PersistentProcess', () => {
     // Process should still be alive (didn't hang)
     expect(pp.isAlive).toBe(true);
   });
+
+  it('treats the first extension_ui_request (ui.notify) as the ready signal', async () => {
+    // Pi's loaded extensions emit a ui.notify as the very first stdout frame
+    // after RPC mode starts. waitUntilReady() must unblock on that frame —
+    // otherwise fangai's server.ts:187 throws "Persistent process did not
+    // become ready within 30s" even though pi is healthy.
+    pp = new PersistentProcess('cat', [], {});
+    await pp.ensure();
+
+    const ready = pp.waitUntilReady(2_000);
+    // Simulate pi's init notify frame
+    pp.write('{"type":"extension_ui_request","id":"n1","method":"notify","message":"A2A communication initialized","notifyType":"info"}\n');
+
+    await ready; // must resolve, not reject
+    expect((pp as any).readyEmitted).toBe(true);
+  });
+
+  it('signalReadyDone is idempotent — second extension_ui_request does not double-fire', async () => {
+    pp = new PersistentProcess('cat', [], {});
+    await pp.ensure();
+
+    pp.write('{"type":"extension_ui_request","id":"n1","method":"notify","message":"first","notifyType":"info"}\n');
+    await pp.waitUntilReady(2_000);
+    const firstEmitted = (pp as any).readyEmitted;
+    expect(firstEmitted).toBe(true);
+
+    pp.write('{"type":"extension_ui_request","id":"u2","method":"confirm","message":"Continue?"}\n');
+    await new Promise(r => setTimeout(r, 100));
+    // Still alive after the second one; readyEmitted stays true and not reset.
+    expect(pp.isAlive).toBe(true);
+    expect((pp as any).readyEmitted).toBe(true);
+  });
 });
 
 // ─── detectAdapters ────────────────────────────────────────────────────────

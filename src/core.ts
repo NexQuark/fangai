@@ -256,7 +256,9 @@ export class ProcessManager {
 // the next queued task becomes active.
 //
 // Pi / oh-my-pi additions:
-// - `waitUntilReady()` — first `{ "type":"ready" }` from stdout before commands
+// - `waitUntilReady()` — first `{ "type":"ready" }` OR first
+//   `{ "type":"extension_ui_request", ... }` (pi's extension ui.notify on
+//   init) from stdout before commands
 // - `sendRpcCommand` — stdin JSON-RPC-style commands correlated by optional `id`
 // - Host tool callbacks — executes `host_tool_call` writes `host_tool_result`
 // Extension UI responses — auto-respond so the agent doesn't hang.
@@ -318,8 +320,12 @@ export class PersistentProcess {
   }
 
   /**
-   * Resolves once the child emits `{ "type": "ready" }` over stdout,
-   * or rejects on timeout after `ensure()` spawned the process.
+   * Resolves once the child signals readiness over stdout — either the
+   * canonical `{ "type": "ready" }` frame, or the first
+   * `{ "type": "extension_ui_request", ... }` frame (pi's loaded extensions
+   * emit this as soon as RPC mode is alive via ui.notify on init).
+   *
+   * Rejects on timeout after `ensure()` spawned the process.
    */
   async waitUntilReady(timeoutMs = 30_000): Promise<void> {
     if (this.readyEmitted) return;
@@ -372,8 +378,14 @@ export class PersistentProcess {
 
   /** Internal: correlate or route a stdout JSON frame before forwarding to adapters. Returns true if swallowed. */
   private dispatchStdoutJson(parsed: Record<string, unknown>): boolean {
-    // Extension UI dialogs — mutate stdin (must precede swallow rules)
+    // Extension UI dialogs — mutate stdin (must precede swallow rules).
+    // Also serves as the readiness signal for pi's RPC mode: pi's loaded
+    // extensions emit their first frame as `ui.notify(...)` which produces
+    // {type:"extension_ui_request", method:"notify", ...}. Trigger ready here
+    // so waitUntilReady() unblocks as soon as the RPC pipeline is alive —
+    // signalReadyDone() is idempotent and a no-op if readyEmitted is true.
     if (parsed.type === 'extension_ui_request') {
+      this.signalReadyDone();
       this.handleExtensionUIParsed(parsed);
       return false;
     }
