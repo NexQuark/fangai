@@ -19,6 +19,7 @@ import {
 } from './core.ts';
 import { CursorAgentAdapter, CursorSessionStore, type CursorSession } from './cursor-adapter.ts';
 import { FangTaskStore } from './fang-task-store.ts';
+import { TaskEventStore } from './task-event-store.ts';
 
 // ─── BridgeExecutor ────────────────────────────────────────────────────────
 
@@ -29,6 +30,20 @@ export class BridgeExecutor implements AgentExecutor {
   private config: FangConfig;
   /** taskId → contextId for lifecycle + cancel signaling */
   private contextByTaskId = new Map<string, string>();
+  /** Per-task event log — feeds /tasks/{id}/events SSE replay. */
+  readonly events = new TaskEventStore();
+
+  /**
+   * Tap into bus.publish so every emitted event is also recorded in the event
+   * store for SSE replay. Wraps once per execute() — no per-call-site churn.
+   */
+  private tapBus(bus: ExecutionEventBus, taskId: string): void {
+    const original = bus.publish.bind(bus);
+    bus.publish = (event) => {
+      this.events.append(taskId, event);
+      original(event);
+    };
+  }
 
   /**
    * Publish a v1.0-shaped AgentExecutionEvent on the bus. v1.0 wraps every
@@ -62,6 +77,7 @@ export class BridgeExecutor implements AgentExecutor {
   async execute(ctx: RequestContext, bus: ExecutionEventBus): Promise<void> {
     const taskId = ctx.taskId;
     const contextId = ctx.contextId;
+    this.tapBus(bus, taskId);
 
     // Extract user text
     const parts = ctx.userMessage.parts ?? [];
@@ -512,13 +528,10 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
   const { adapter, port, ...rest } = config;
   const name = config.name || adapter.displayName + '-agent';
 
-  const agentCard = {
+  const agentCardBase = {
     name,
     description: `${adapter.displayName} via fang — A2A bridge`,
-    protocolVersion: '1.0',
     version: '1.0.0',
-    url: process.env.FANG_PUBLIC_URL ?? `http://localhost:${port}`,
-    capabilities: { streaming: true },
     skills: adapter.skills.map(s => ({ ...s, description: s.name })),
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain'],
@@ -527,6 +540,48 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       tier: adapter.tier,
       mode: adapter.mode,
     },
+  };
+
+  // A2A v1.0 AgentCard shape (see @a2a-js/sdk@1.0.1 `AgentCard`). v1.0 dropped
+  // the v0.3 top-level `protocolVersion` / `url` / `preferredTransport` /
+  // `security` in favor of `supportedInterfaces[*]` (which carries the
+  // transport-specific URL + protocolVersion + protocolBinding) and a
+  // top-level `securityRequirements` array. Several fields that were
+  // optional in v0.3 are now required: `signatures`, `provider`,
+  // `capabilities`, `securitySchemes`. The `legacyCompat` option on
+  // the agentCardHandler below lets the same card be served in the v0.3
+  // shape (via toCompatAgentCard) to clients that opt in with
+  // `A2A-Version: 0.3`.
+  const baseUrl = process.env.FANG_PUBLIC_URL ?? `http://localhost:${port}`;
+  const agentCard = {
+    ...agentCardBase,
+    supportedInterfaces: [
+      { url: `${baseUrl}/a2a/rest`,   protocolBinding: 'HTTP+JSON', protocolVersion: '1.0', tenant: '' },
+      { url: `${baseUrl}/a2a/jsonrpc`, protocolBinding: 'JSONRPC',    protocolVersion: '1.0', tenant: '' },
+    ],
+    // Required in v1.0 (was optional in v0.3). Empty array is the spec-
+    // compliant way to say "no JWS signatures on this card yet"; signing
+    // is a future enhancement.
+    signatures: [],
+    // Required in v1.0 (can be undefined). fangai does not advertise a
+    // separate provider entity; the bridge is the agent's own identity.
+    provider: undefined,
+    // Required in v1.0. The /readyz and /tasks/:id/events endpoints are
+    // custom additions not in the A2A spec, so extensions stays empty.
+    capabilities: {
+      streaming: true,
+      pushNotifications: false,
+      extensions: [],
+    },
+    // Required in v1.0. Empty map when no auth is configured; bearer
+    // scheme advertised only when an --api-key is set so unauthenticated
+    // deployments stay free of misleading auth hints.
+    securitySchemes: config.apiKey
+      ? { bearer: { type: 'http', scheme: 'bearer' } }
+      : {},
+    // Required in v1.0. Empty array by default; populated only when
+    // --api-key is configured (replaces v0.3's `security: [{ ... }]`).
+    securityRequirements: config.apiKey ? [{ bearer: [] }] : [],
   };
 
   const executor = new BridgeExecutor(adapter, { ...rest, port });
@@ -552,8 +607,39 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       }
 
       // Public routes — must be mounted BEFORE auth gate (A2A spec requires public agent card)
-      app.use('/.well-known/agent-card.json', agentCardHandler({ agentCardProvider: requestHandler }));
-      app.get('/health', (_req: Request, res: Response) => {
+      // legacyCompat.enabled lets a v0.3 client (identified by the
+      // A2A-Version: 0.3 header, or by omitting the header entirely)
+      // receive a v0.3-shaped card via toCompatAgentCard(). v1.0 clients
+      // get the canonical v1.0 card unchanged. Per-version ETags and a
+      // Vary: A2A-Version response header keep shared HTTP caches from
+      // serving the wrong shape to the wrong client.
+      app.use('/.well-known/agent-card.json', agentCardHandler({
+        agentCardProvider: requestHandler,
+        legacyCompat: { enabled: true },
+      }));
+      // Readiness probe: 200 if the wrapped CLI agent is alive AND has signalled ready.
+      // Distinct from /health (server liveness) and from agentAlive:false cases where
+      // the HTTP server is up but the spawn-on-first-task model means pi hasn't started yet.
+      app.get('/readyz', (_req: Request, res: Response) => {
+        if (adapter.mode !== 'persistent') {
+          // oneshot adapters don't have a persistent agent to be ready
+          return res.status(200).json({ status: 'ready', mode: 'oneshot' });
+        }
+        const pp = executor['persistent'] as PersistentProcess | null;
+        const alive = pp?.isAlive ?? false;
+        const ready = pp?.['readyEmitted'] ?? false;
+        const ok = alive && ready;
+        res.status(ok ? 200 : 503).json({
+          status: ok ? 'ready' : 'not_ready',
+          mode: 'persistent',
+          agentAlive: alive,
+          readySignaled: ready,
+          persistentQueue: executor.getPersistentQueueInfo(),
+        });
+      });
+      // Extract the legacy /health handler so we can also mount it at /healthz
+      // (the path the A2A spec calls for). The handler is unchanged.
+      const legacyHealthHandler = (_req: Request, res: Response): void => {
         const pq = executor.getPersistentQueueInfo();
         const base: Record<string, unknown> = {
           status: 'ok',
@@ -582,7 +668,11 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
           });
         }
         res.json(base);
-      });
+      };
+      // Mount both /health (legacy) and /healthz (spec/01). /health stays for
+      // backwards compatibility with operators and probes already configured.
+      app.get('/health', legacyHealthHandler);
+      app.get('/healthz', legacyHealthHandler);
 
       // Auth gate — applied to all routes below this point only
       if (config.apiKey) {
@@ -595,8 +685,172 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       }
 
       // A2A endpoints — protected by auth gate above (if configured)
-      app.use('/a2a/jsonrpc', jsonRpcHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
-      app.use('/a2a/rest', restHandler({ requestHandler, userBuilder: UserBuilder.noAuthentication }));
+      // JSON-RPC + REST handlers also gain legacyCompat so a v0.3 client
+      // sending `A2A-Version: 0.3` (or no header at all) gets the v0.3
+      // request envelope accepted and routed through the SDK's compat
+      // module. v1.0 clients get the canonical v1.0 path.
+      app.use('/a2a/jsonrpc', jsonRpcHandler({
+        requestHandler,
+        userBuilder: UserBuilder.noAuthentication,
+        legacyCompat: { enabled: true },
+      }));
+      app.use('/a2a/rest', restHandler({
+        requestHandler,
+        userBuilder: UserBuilder.noAuthentication,
+        legacyCompat: { enabled: true },
+      }));
+
+      // ── Task status lookup (spec/01) ──────────────────────────────────
+      // @a2a-js/sdk's express handlers expose GetTask only via the JSON-RPC
+      // and REST envelopes above. spec/01 also lists GET /tasks/{id} as a
+      // first-class endpoint for orchestrators to poll without re-parsing
+      // JSON-RPC envelopes. 404 when the task ID is unknown.
+      app.get('/tasks/:id', async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+        try {
+          const task = await taskStore.load(req.params.id);
+          if (!task) {
+            return res.status(404).json({ error: { message: `Task ${req.params.id} not found` } });
+          }
+          res.json(task);
+        } catch (err) {
+          next(err);
+        }
+      });
+
+      // POST /tasks/:id/cancel — spec/02 + spec/07 cancellation protocol.
+      // spec/07: 404 if unknown, 409 if already terminal, 200 with final task state.
+      // We do not call executor.cancelTask() because the SDK's bus manager is
+      // private and we cannot thread the cancellation event back to taskStore
+      // that way. Instead we SIGTERM the underlying process and write the
+      // canceled state directly to both taskStore and the SSE event log.
+      app.post('/tasks/:id/cancel', async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+        const taskId = req.params.id;
+        try {
+          const existing = await taskStore.load(taskId);
+          if (!existing) {
+            return res.status(404).json({
+              error: { code: 'TASK_NOT_FOUND', message: `Task ${taskId} not found`, details: { taskId } },
+            });
+          }
+          const terminal = ['completed', 'failed', 'canceled', 'rejected'].includes(existing.status.state);
+          if (terminal) {
+            return res.status(409).json({
+              error: {
+                code: 'TASK_ALREADY_COMPLETED',
+                message: `Task ${taskId} is already in terminal state ${existing.status.state}`,
+                details: { taskId, state: existing.status.state },
+              },
+              task: existing,
+            });
+          }
+
+          // SIGTERM the oneshot child (if any) and detach the persistent
+          // line handler. ProcessManager already enforces SIGKILL after its
+          // own grace window — fire-and-forget here per spec/07 step 5.
+          executor['pm'].kill(taskId);
+          const pp = executor['persistent'] as PersistentProcess | null;
+          if (pp) pp.removeLineHandler(taskId);
+
+          const cancelMessage = {
+            kind: 'message' as const,
+            role: 'agent' as const,
+            messageId: randomUUID(),
+            contextId: existing.contextId,
+            taskId,
+            parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
+          };
+          const canceledStatus = {
+            state: 'canceled' as const,
+            message: cancelMessage,
+            timestamp: new Date().toISOString(),
+          };
+          const canceledTask = { ...existing, status: canceledStatus };
+          await taskStore.save(canceledTask);
+
+          // Record into the per-task event store so SSE subscribers see it.
+          executor.events.append(taskId, {
+            kind: 'status-update',
+            taskId,
+            contextId: existing.contextId,
+            final: true,
+            status: canceledStatus,
+          });
+
+          res.status(200).json(canceledTask);
+        } catch (err) {
+          next(err);
+        }
+      });
+
+      // ── Task event stream (SSE) — spec/01 line 24 ───────────────────
+      // GET /tasks/{id}/events replays every per-task event published via the
+      // ExecutionEventBus during execute(). Supports both the standard SSE
+      // Last-Event-ID header and an explicit ?from=<seq> query param for
+      // reconnecting clients. Auto-closes after the task enters a terminal
+      // state (completed/failed/canceled/rejected) with an `event: end` marker.
+      app.get('/tasks/:id/events', (req: Request<{ id: string }, {}, {}, { from?: string }>, res: Response) => {
+        const taskId = req.params.id;
+        void taskStore.load(taskId).then((task) => {
+          if (!task) {
+            res.status(404).json({ error: { message: `Task ${taskId} not found` } });
+            return;
+          }
+          const fromHeader = req.headers['last-event-id'];
+          const fromHeaderNum = typeof fromHeader === 'string' ? parseInt(fromHeader, 10) : NaN;
+          const fromQueryNum = req.query?.from !== undefined ? parseInt(req.query.from, 10) : NaN;
+          const fromSeq = Number.isFinite(fromHeaderNum) && fromHeaderNum > 0
+            ? fromHeaderNum
+            : (Number.isFinite(fromQueryNum) && fromQueryNum > 0 ? fromQueryNum : 0);
+
+          res.setHeader('Content-Type', 'text/event-stream');
+          res.setHeader('Cache-Control', 'no-cache, no-transform');
+          res.setHeader('Connection', 'keep-alive');
+          res.setHeader('X-Accel-Buffering', 'no');
+          res.flushHeaders?.();
+
+          const writeEntry = (entry: ReturnType<TaskEventStore['read']>[number]): void => {
+            res.write(`id: ${entry.seq}\n`);
+            res.write(`event: ${(entry.event as { kind: string }).kind}\n`);
+            res.write(`data: ${JSON.stringify(entry.event)}\n\n`);
+          };
+
+          for (const entry of executor.events.read(taskId, fromSeq)) writeEntry(entry);
+
+          const terminal = ['completed', 'failed', 'canceled', 'rejected'].includes(task.status.state);
+          if (terminal) {
+            res.write(`event: end\ndata: {"state":"${task.status.state}"}\n\n`);
+            res.end();
+            return;
+          }
+
+          let lastSeq = executor.events.latestSeq(taskId);
+          const interval = setInterval(() => {
+            const live = executor.events.read(taskId, lastSeq);
+            for (const entry of live) {
+              writeEntry(entry);
+              lastSeq = entry.seq;
+              const k = (entry.event as { kind: string }).kind;
+              if (k === 'status-update') {
+                const final = (entry.event as { final?: boolean }).final;
+                const state = (entry.event as { status?: { state?: string } }).status?.state;
+                if (final && state && ['completed', 'failed', 'canceled', 'rejected'].includes(state)) {
+                  clearInterval(interval);
+                  res.write(`event: end\ndata: {"state":"${state}"}\n\n`);
+                  res.end();
+                  return;
+                }
+              }
+            }
+          }, 250);
+
+          req.on('close', () => {
+            clearInterval(interval);
+            try { res.end(); } catch { /* noop */ }
+          });
+        }).catch((err) => {
+          res.status(500).json({ error: { message: String((err as Error).message ?? err) } });
+        });
+      });
 
       // ── Cursor-specific management endpoints ────────────────────────
       // Only mounted when adapter is CursorAgentAdapter
