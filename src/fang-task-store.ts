@@ -3,14 +3,15 @@
  * Implements @a2a-js/sdk@1.0.1 TaskStore: save / load / list.
  */
 
-import type { ListTasksRequest, ListTasksResponse, Task, TaskState } from '@a2a-js/sdk';
+import { TaskState } from '@a2a-js/sdk';
+import type { ListTasksRequest, ListTasksResponse, Task } from '@a2a-js/sdk';
 import type { TaskStore, ServerCallContext } from '@a2a-js/sdk/server';
 
 const TERMINAL_STATES: ReadonlySet<TaskState> = new Set<TaskState>([
-  'completed' as TaskState,
-  'failed' as TaskState,
-  'canceled' as TaskState,
-  'rejected' as TaskState,
+  TaskState.TASK_STATE_COMPLETED,
+  TaskState.TASK_STATE_FAILED,
+  TaskState.TASK_STATE_CANCELED,
+  TaskState.TASK_STATE_REJECTED,
 ]);
 
 interface StoredEntry {

@@ -5,7 +5,14 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { AgentExecutor, RequestContext, ExecutionEventBus } from '@a2a-js/sdk/server';
+import { TaskState } from '@a2a-js/sdk';
+import type { AgentExecutor, RequestContext, ExecutionEventBus, ServerCallContext } from '@a2a-js/sdk/server';
+
+/** A no-op ServerCallContext for REST endpoints that aren't invoked through
+ *  the SDK's request handler (so no real user/tenant is attached). fangai's
+ *  cancel / status / SSE routes are mounted directly on Express; we pass
+ *  this empty context to the v1.0 TaskStore methods that now require it. */
+const EMPTY_CTX = {} as ServerCallContext;
 import { DefaultRequestHandler } from '@a2a-js/sdk/server';
 import {
   agentCardHandler, jsonRpcHandler, restHandler, UserBuilder,
@@ -532,14 +539,20 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
     name,
     description: `${adapter.displayName} via fang — A2A bridge`,
     version: '1.0.0',
-    skills: adapter.skills.map(s => ({ ...s, description: s.name })),
+    skills: adapter.skills.map(s => ({
+      ...s,
+      description: s.name,
+      // v1.0 AgentSkill requires these fields. Adapter skills only
+      // declare id+name+tags, so we default the rest: empty examples,
+      // inherit agent-level defaultInputModes/defaultOutputModes, no
+      // skill-level security override.
+      examples: [],
+      inputModes: [],
+      outputModes: [],
+      securityRequirements: [],
+    })),
     defaultInputModes: ['text/plain'],
     defaultOutputModes: ['text/plain'],
-    metadata: {
-      bridge: 'fang',
-      tier: adapter.tier,
-      mode: adapter.mode,
-    },
   };
 
   // A2A v1.0 AgentCard shape (see @a2a-js/sdk@1.0.1 `AgentCard`). v1.0 dropped
@@ -555,9 +568,15 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
   const baseUrl = process.env.FANG_PUBLIC_URL ?? `http://localhost:${port}`;
   const agentCard = {
     ...agentCardBase,
+    // Two v1.0 interfaces (HTTP+JSON REST + JSONRPC) plus a v0.3 entry so the
+    // SDK's legacyCompat layer can serve the v0.3-shaped card (via
+    // toCompatAgentCard) when a v0.3 client requests it with
+    // A2A-Version: 0.3 (or no header — default is 0.3). Without the v0.3
+    // entry, legacyCompat returns 400 VERSION_NOT_SUPPORTED.
     supportedInterfaces: [
-      { url: `${baseUrl}/a2a/rest`,   protocolBinding: 'HTTP+JSON', protocolVersion: '1.0', tenant: '' },
       { url: `${baseUrl}/a2a/jsonrpc`, protocolBinding: 'JSONRPC',    protocolVersion: '1.0', tenant: '' },
+      { url: `${baseUrl}/a2a/rest`,   protocolBinding: 'HTTP+JSON', protocolVersion: '1.0', tenant: '' },
+      { url: baseUrl,                 protocolBinding: 'JSONRPC',    protocolVersion: '0.3', tenant: '' },
     ],
     // Required in v1.0 (was optional in v0.3). Empty array is the spec-
     // compliant way to say "no JWS signatures on this card yet"; signing
@@ -590,7 +609,12 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
 
   const executor = new BridgeExecutor(adapter, { ...rest, port });
   const taskStore = new FangTaskStore();
-  const requestHandler = new DefaultRequestHandler(agentCard, taskStore, executor);
+  // The SDK's AgentCard type is built from the v1.0 schema with internal
+  // exactOptionalPropertyTypes and a few private discriminator fields; the
+  // structural cast keeps the card shape obvious at the call site.
+  const requestHandler = new (DefaultRequestHandler as unknown as new (
+    card: unknown, store: unknown, exec: unknown,
+  ) => InstanceType<typeof DefaultRequestHandler>)(agentCard, taskStore, executor);
 
   return {
     executor,
@@ -711,7 +735,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       // JSON-RPC envelopes. 404 when the task ID is unknown.
       app.get('/tasks/:id', async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
         try {
-          const task = await taskStore.load(req.params.id);
+          const task = await taskStore.load(req.params.id, EMPTY_CTX);
           if (!task) {
             return res.status(404).json({ error: { message: `Task ${req.params.id} not found` } });
           }
@@ -730,7 +754,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       app.post('/tasks/:id/cancel', async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
         const taskId = req.params.id;
         try {
-          const existing = await taskStore.load(taskId);
+          const existing = await taskStore.load(taskId, EMPTY_CTX);
           if (!existing) {
             return res.status(404).json({
               error: { code: 'TASK_NOT_FOUND', message: `Task ${taskId} not found`, details: { taskId } },
@@ -738,8 +762,12 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
           }
           // v1.0 SDK types Task.status as TaskStatus | undefined, so guard explicitly.
           const currentState = existing.status?.state;
-          const terminal = currentState !== undefined
-            && ['completed', 'failed', 'canceled', 'rejected'].includes(currentState);
+          const terminal = currentState !== undefined && (
+            currentState === TaskState.TASK_STATE_COMPLETED
+            || currentState === TaskState.TASK_STATE_FAILED
+            || currentState === TaskState.TASK_STATE_CANCELED
+            || currentState === TaskState.TASK_STATE_REJECTED
+          );
           if (terminal) {
             return res.status(409).json({
               error: {
@@ -767,12 +795,12 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
             parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
           };
           const canceledStatus = {
-            state: 'canceled' as const,
+            state: TaskState.TASK_STATE_CANCELED as typeof TaskState.TASK_STATE_CANCELED,
             message: cancelMessage,
             timestamp: new Date().toISOString(),
           };
           const canceledTask = { ...existing, status: canceledStatus };
-          await taskStore.save(canceledTask, {} as Parameters<typeof taskStore.save>[1]);
+          await taskStore.save(canceledTask as unknown as Parameters<typeof taskStore.save>[0], EMPTY_CTX);
 
           // Record into the per-task event store so SSE subscribers see it.
           // v1.0 envelope: {kind: 'statusUpdate', data: {...}}.
@@ -783,7 +811,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
               contextId: existing.contextId,
               status: canceledStatus,
             },
-          } as Parameters<typeof executor.events.append>[1]);
+          } as unknown as Parameters<typeof executor.events.append>[1]);
 
           res.status(200).json(canceledTask);
         } catch (err) {
@@ -799,7 +827,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
       // state (completed/failed/canceled/rejected) with an `event: end` marker.
       app.get('/tasks/:id/events', (req: Request<{ id: string }, {}, {}, { from?: string }>, res: Response) => {
         const taskId = req.params.id;
-        void taskStore.load(taskId).then((task) => {
+        void taskStore.load(taskId, EMPTY_CTX).then((task) => {
           if (!task) {
             res.status(404).json({ error: { message: `Task ${taskId} not found` } });
             return;
@@ -827,8 +855,12 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
 
           // v1.0 SDK types Task.status as TaskStatus | undefined, so guard explicitly.
           const currentState = task.status?.state;
-          const terminal = currentState !== undefined
-            && ['completed', 'failed', 'canceled', 'rejected'].includes(currentState);
+          const terminal = currentState !== undefined && (
+            currentState === TaskState.TASK_STATE_COMPLETED
+            || currentState === TaskState.TASK_STATE_FAILED
+            || currentState === TaskState.TASK_STATE_CANCELED
+            || currentState === TaskState.TASK_STATE_REJECTED
+          );
           if (terminal) {
             res.write(`event: end\ndata: {"state":"${currentState}"}\n\n`);
             res.end();
