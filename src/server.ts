@@ -30,6 +30,26 @@ export class BridgeExecutor implements AgentExecutor {
   /** taskId → contextId for lifecycle + cancel signaling */
   private contextByTaskId = new Map<string, string>();
 
+  /**
+   * Publish a v1.0-shaped AgentExecutionEvent on the bus. v1.0 wraps every
+   * event in a discriminated { kind, data } envelope (see @a2a-js/sdk@1.0.1
+   * `AgentExecutionEvent`): the v0.3 flat form the executor used to publish
+   * is no longer accepted by the SDK's ResultManager listener.
+   *
+   * Kinds map to:
+   *   'task'          -> data: Task
+   *   'message'       -> data: Message
+   *   'statusUpdate'  -> data: TaskStatusUpdateEvent   (was 'status-update' in v0.3)
+   *   'artifactUpdate'-> data: TaskArtifactUpdateEvent (was 'artifact-update' in v0.3)
+   */
+  private pub(
+    bus: ExecutionEventBus,
+    kind: 'task' | 'message' | 'statusUpdate' | 'artifactUpdate',
+    data: unknown,
+  ): void {
+    bus.publish({ kind, data } as Parameters<ExecutionEventBus['publish']>[0]);
+  }
+
   constructor(adapter: AgentAdapter, config: FangConfig) {
     this.adapter = adapter;
     this.config = config;
@@ -76,8 +96,7 @@ export class BridgeExecutor implements AgentExecutor {
     // Seed the ResultManager with a task event so it can track this execution.
     // Without this, status-update/artifact-update events reference an unknown taskId
     // and ResultManager.currentTask stays null → "no task context found" on completion.
-    bus.publish({
-      kind: 'task',
+    this.pub(bus, 'task', {
       id: taskId,
       contextId,
       status: { state: 'working', timestamp: new Date().toISOString() },
@@ -108,8 +127,8 @@ export class BridgeExecutor implements AgentExecutor {
           for (const ev of events) {
             if (ev.type === 'text-delta' && ev.text) {
               accumulated += ev.text;
-              bus.publish({
-                kind: 'artifact-update', taskId, contextId,
+              this.pub(bus, 'artifactUpdate', {
+                taskId, contextId,
                 artifact: { artifactId: 'stdout', name: 'output', parts: [{ kind: 'text', text: ev.text }] },
                 append: true, lastChunk: false,
               });
@@ -118,7 +137,13 @@ export class BridgeExecutor implements AgentExecutor {
               settled = true;
               clearTimeout(timer);
               this.forgetTrackedTask(taskId);
-              bus.publish({ kind: 'message', messageId: randomUUID(), role: 'agent', parts: [{ kind: 'text', text: accumulated || 'Done' }] });
+              this.pub(bus, 'message', {
+                messageId: randomUUID(),
+                contextId,
+                taskId,
+                role: 'agent',
+                parts: [{ kind: 'text', text: accumulated || 'Done' }],
+              });
               bus.finished();
               resolve();
             }
@@ -126,9 +151,20 @@ export class BridgeExecutor implements AgentExecutor {
               settled = true;
               clearTimeout(timer);
               this.forgetTrackedTask(taskId);
-              bus.publish({
-                kind: 'status-update', taskId, contextId, final: true,
-                status: { state: 'failed', message: { kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'text', text: ev.message }] }, timestamp: new Date().toISOString() },
+              this.pub(bus, 'statusUpdate', {
+                taskId, contextId,
+                status: {
+                  state: 'failed',
+                  message: {
+                    kind: 'message',
+                    messageId: randomUUID(),
+                    contextId,
+                    taskId,
+                    role: 'agent',
+                    parts: [{ kind: 'text', text: ev.message }],
+                  },
+                  timestamp: new Date().toISOString(),
+                },
               });
               bus.finished();
               resolve();
@@ -136,8 +172,8 @@ export class BridgeExecutor implements AgentExecutor {
           }
         },
         onError: (text) => {
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: { artifactId: 'stderr', name: 'errors', parts: [{ kind: 'text', text }] },
           });
         },
@@ -147,10 +183,22 @@ export class BridgeExecutor implements AgentExecutor {
           settled = true;
           if (code === 0) {
             this.forgetTrackedTask(taskId);
-            bus.publish({ kind: 'message', messageId: randomUUID(), role: 'agent', parts: [{ kind: 'text', text: accumulated || '(no output)' }] });
+            this.pub(bus, 'message', {
+              messageId: randomUUID(),
+              contextId,
+              taskId,
+              role: 'agent',
+              parts: [{ kind: 'text', text: accumulated || '(no output)' }],
+            });
           } else {
             this.forgetTrackedTask(taskId);
-            bus.publish({ kind: 'message', messageId: randomUUID(), role: 'agent', parts: [{ kind: 'text', text: `Error: exit code ${code}` }] });
+            this.pub(bus, 'message', {
+              messageId: randomUUID(),
+              contextId,
+              taskId,
+              role: 'agent',
+              parts: [{ kind: 'text', text: `Error: exit code ${code}` }],
+            });
           }
           bus.finished();
           resolve();
@@ -168,8 +216,7 @@ export class BridgeExecutor implements AgentExecutor {
     const timeout = config.taskTimeout ?? 600;
 
     // Seed ResultManager — same reason as executeOneshot
-    bus.publish({
-      kind: 'task',
+    this.pub(bus, 'task', {
       id: taskId,
       contextId,
       status: { state: 'working', timestamp: new Date().toISOString() },
@@ -213,8 +260,8 @@ export class BridgeExecutor implements AgentExecutor {
       for (const ev of events) {
         if ((ev.type === 'text-delta' || ev.type === 'thinking') && ev.text) {
           accumulated += ev.text;
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: ev.type === 'thinking' ? 'pi-thinking' : 'stdout',
               name: ev.type === 'thinking' ? 'thinking' : 'output',
@@ -224,8 +271,8 @@ export class BridgeExecutor implements AgentExecutor {
           });
         }
         if (ev.type === 'tool-call') {
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: 'pi-agent-tool-call',
               name: 'tool-call',
@@ -235,8 +282,8 @@ export class BridgeExecutor implements AgentExecutor {
           });
         }
         if (ev.type === 'tool-result') {
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: 'pi-agent-tool-result',
               name: 'tool-result',
@@ -247,8 +294,8 @@ export class BridgeExecutor implements AgentExecutor {
         }
         if (ev.type === 'protocol-log') {
           const detail = ev.detail ? ` ${JSON.stringify(ev.detail)}` : '';
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: `pi-protocol-${ev.subtype}`,
               name: `pi-protocol/${ev.subtype}`,
@@ -259,8 +306,8 @@ export class BridgeExecutor implements AgentExecutor {
           });
         }
         if (ev.type === 'host-tool-request') {
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: 'pi-host-tool-request',
               name: `host-tool/${ev.tool}`,
@@ -273,8 +320,8 @@ export class BridgeExecutor implements AgentExecutor {
           });
         }
         if (ev.type === 'host-tool-cancel') {
-          bus.publish({
-            kind: 'artifact-update', taskId, contextId,
+          this.pub(bus, 'artifactUpdate', {
+            taskId, contextId,
             artifact: {
               artifactId: 'pi-host-tool-cancel',
               name: 'host-tool-cancel',
@@ -291,14 +338,20 @@ export class BridgeExecutor implements AgentExecutor {
           clearTimeout(timer);
           // Publish final message for sync clients
           this.forgetTrackedTask(taskId);
-          bus.publish({ kind: 'message', messageId: randomUUID(), role: 'agent', parts: [{ kind: 'text', text: accumulated || 'Done' }] });
+          this.pub(bus, 'message', {
+            messageId: randomUUID(),
+            contextId,
+            taskId,
+            role: 'agent',
+            parts: [{ kind: 'text', text: accumulated || 'Done' }],
+          });
           bus.finished();
           // Clean up handler after completion
           this.persistent!.removeLineHandler(taskId);
         }
         if (ev.type === 'status' && ev.state === 'working') {
-          bus.publish({
-            kind: 'status-update', taskId, contextId, final: false,
+          this.pub(bus, 'statusUpdate', {
+            taskId, contextId,
             status: { state: 'working', timestamp: new Date().toISOString() },
           });
         }
@@ -306,9 +359,20 @@ export class BridgeExecutor implements AgentExecutor {
           settled = true;
           clearTimeout(timer);
           this.forgetTrackedTask(taskId);
-          bus.publish({
-            kind: 'status-update', taskId, contextId, final: true,
-            status: { state: 'failed', message: { kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'text', text: ev.message }] }, timestamp: new Date().toISOString() },
+          this.pub(bus, 'statusUpdate', {
+            taskId, contextId,
+            status: {
+              state: 'failed',
+              message: {
+                kind: 'message',
+                messageId: randomUUID(),
+                contextId,
+                taskId,
+                role: 'agent',
+                parts: [{ kind: 'text', text: ev.message }],
+              },
+              timestamp: new Date().toISOString(),
+            },
           });
           bus.finished();
           this.persistent!.removeLineHandler(taskId);
@@ -373,11 +437,9 @@ export class BridgeExecutor implements AgentExecutor {
             parts: [{ kind: 'text' as const, text: 'Task canceled by client.' }],
           };
 
-    bus.publish({
-      kind: 'status-update',
+    this.pub(bus, 'statusUpdate', {
       taskId,
       contextId: cid !== '' ? cid : taskId,
-      final: true,
       status: {
         state: 'canceled',
         message: cancelMessage,
@@ -413,9 +475,20 @@ export class BridgeExecutor implements AgentExecutor {
 
   private publishMessage(bus: ExecutionEventBus, taskId: string, contextId: string, text: string, state: 'failed' | 'rejected' = 'failed') {
     this.forgetTrackedTask(taskId);
-    bus.publish({
-      kind: 'status-update', taskId, contextId, final: true,
-      status: { state, message: { kind: 'message', role: 'agent', messageId: randomUUID(), parts: [{ kind: 'text', text }] }, timestamp: new Date().toISOString() },
+    this.pub(bus, 'statusUpdate', {
+      taskId, contextId,
+      status: {
+        state,
+        message: {
+          kind: 'message',
+          messageId: randomUUID(),
+          contextId,
+          taskId,
+          role: 'agent',
+          parts: [{ kind: 'text', text }],
+        },
+        timestamp: new Date().toISOString(),
+      },
     });
   }
 
@@ -442,7 +515,7 @@ export function createFangServer(config: FangConfig & { adapter: AgentAdapter })
   const agentCard = {
     name,
     description: `${adapter.displayName} via fang — A2A bridge`,
-    protocolVersion: '0.3.0',
+    protocolVersion: '1.0',
     version: '1.0.0',
     url: process.env.FANG_PUBLIC_URL ?? `http://localhost:${port}`,
     capabilities: { streaming: true },
