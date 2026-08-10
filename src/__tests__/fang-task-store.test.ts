@@ -73,12 +73,7 @@ describe('FangTaskStore', () => {
     const store2 = new FangTaskStore({
       completedRetentionMinutes: 0,
     });
-    // Seed with the string state cast to TaskState (not the enum value)
-    // so the store's internal TERMINAL_STATES set — populated with string
-    // literals — can detect the task as terminal. Once the prod code is
-    // updated to use TaskState enum values, this can switch to
-    // TaskState.TASK_STATE_COMPLETED.
-    await store2.save(makeTask('old', 'completed' as unknown as TaskState), ctx);
+    await store2.save(makeTask('old', TaskState.TASK_STATE_COMPLETED), ctx);
 
     interface Intern {
       entries: Map<string, { terminalSinceMs: number | null; task: Task }>;

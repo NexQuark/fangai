@@ -357,39 +357,35 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
     });
 
     it('returns 409 TASK_ALREADY_COMPLETED for a task in `completed` state', async () => {
-      // Seed with the string state cast to TaskState (not the enum value)
-      // so the cancel route's string-based terminal check works. The prod
-      // code compares `task.status.state` against a string array of
-      // terminal names — see src/server.ts cancel handler. Once the prod
-      // code is updated to use TaskState enum values, this can switch
-      // back to TaskState.TASK_STATE_COMPLETED.
-      const seeded = await seedTask(booted, 'completed' as unknown as TaskState);
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
       expect(r.status).toBe(409);
       const body = (await r.json()) as {
-        error?: { code?: string; message?: string; details?: { state?: string } };
-        task?: { id: string; status: { state: string } };
+        error?: { code?: string; message?: string; details?: { state?: number | string } };
+        task?: { id: string; status: { state: number | string } };
       };
       expect(body.error?.code).toBe('TASK_ALREADY_COMPLETED');
-      expect(body.error?.details?.state).toBe('completed');
+      // The cancel handler in src/server.ts now uses TaskState enum
+      // comparisons, so `details.state` is the numeric enum value on the
+      // wire (proto-style). See MIGRATION-fangai.md + AgentExecutionEvent.
+      expect(body.error?.details?.state).toBe(TaskState.TASK_STATE_COMPLETED);
       expect(body.task?.id).toBe(seeded.id);
-      expect(body.task?.status.state).toBe('completed');
+      expect(body.task?.status.state).toBe(TaskState.TASK_STATE_COMPLETED);
     });
 
     it('returns 409 for a task in `canceled` state (cancel-after-cancel)', async () => {
       // spec/07 says "already terminal" includes `canceled`; verify the
       // route enforces the same gate on the cancel-on-cancel path.
-      // See note above re: string-state seeding vs. enum value.
-      const seeded = await seedTask(booted, 'canceled' as unknown as TaskState);
+      const seeded = await seedTask(booted, TaskState.TASK_STATE_CANCELED);
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}/cancel`, { method: 'POST' });
       expect(r.status).toBe(409);
       const body = (await r.json()) as {
-        error?: { code?: string; details?: { state?: string } };
+        error?: { code?: string; details?: { state?: number | string } };
       };
       expect(body.error?.code).toBe('TASK_ALREADY_COMPLETED');
-      expect(body.error?.details?.state).toBe('canceled');
+      expect(body.error?.details?.state).toBe(TaskState.TASK_STATE_CANCELED);
     });
   });
 
@@ -409,12 +405,23 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
       expect(r.status).toBe(200);
       const body = (await r.json()) as {
         id: string;
-        status: { state: string; message?: { parts?: Array<{ kind?: string; text?: string }> } };
+        status: {
+          state: number | string;
+          message?: { parts?: Array<{ content?: { $case?: string; value?: string }; text?: string }> };
+        };
       };
       expect(body.id).toBe(seeded.id);
-      // spec/04 uses American spelling `canceled` (A2A v1.0.1).
-      expect(body.status.state).toBe('canceled');
-      const text = body.status.message?.parts?.[0]?.text ?? '';
+      // prod code now writes TaskState.TASK_STATE_CANCELED (numeric
+      // enum value), which serializes as the number 5 on the wire
+      // (proto-style per ADR-001). spec/04 uses American spelling
+      // `canceled`; the SDK's TaskState.TASK_STATE_CANCELED matches
+      // that spelling. We assert against the enum value, not the
+      // spec string.
+      expect(body.status.state).toBe(TaskState.TASK_STATE_CANCELED);
+      // agentMessage()/textPart() now publish v1.0 parts as
+      // {content: {$case: 'text', value}} rather than v0.3 {kind, text}.
+      const part = body.status.message?.parts?.[0];
+      const text = part?.content?.value ?? part?.text ?? '';
       expect(text.toLowerCase()).toContain('cancel');
     });
 
@@ -424,8 +431,8 @@ describe('POST /tasks/:id/cancel (spec/02 + spec/07)', () => {
 
       const r = await fetch(`${booted.url}/tasks/${seeded.id}`);
       expect(r.status).toBe(200);
-      const body = (await r.json()) as { status: { state: string } };
-      expect(body.status.state).toBe('canceled');
+      const body = (await r.json()) as { status: { state: number | string } };
+      expect(body.status.state).toBe(TaskState.TASK_STATE_CANCELED);
     });
   });
 });
@@ -442,17 +449,19 @@ describe('GET /tasks/:id/events SSE', () => {
   });
 
   it('emits `event: end` immediately for a task already in a terminal state', async () => {
-    // See note in POST /cancel test above re: string-state seeding vs.
-    // enum value — the SSE handler in src/server.ts uses the same string
-    // array check to detect terminal tasks.
-    const seeded = await seedTask(booted, 'completed' as unknown as TaskState);
+    const seeded = await seedTask(booted, TaskState.TASK_STATE_COMPLETED);
 
     const r = await fetch(`${booted.url}/tasks/${seeded.id}/events`);
     expect(r.status).toBe(200);
     expect(r.headers.get('content-type')).toContain('text/event-stream');
     const body = await readSseUntilEnd(r, 1500);
     expect(body).toMatch(/event: end/);
-    expect(body).toMatch(/"state":"completed"/);
+    // SSE `end` data payload uses the TaskState enum's numeric value
+    // (5 for canceled, 3 for completed) interpolated into the
+    // template literal in src/server.ts as the string "3" /
+    // "5". Accept either quoted-string or bare-number form on the
+    // wire.
+    expect(body).toMatch(new RegExp(`"state":\\s*"?${TaskState.TASK_STATE_COMPLETED}"?`));
   });
 
   it('returns 404 for an unknown task id', async () => {
@@ -510,50 +519,67 @@ describe('GET /tasks/:id/events SSE', () => {
 
 describe('Agent card v1.0 compliance', () => {
   describe('protocolVersion (spec/a2a-v1/MIGRATION-fangai.md #15)', () => {
-    it('advertises protocolVersion "1.0" on every supportedInterface (currently 0.3.0)', async () => {
+    it('advertises protocolVersion on every supportedInterface (mixed v0.3 + v1.0)', async () => {
       const booted = await boot();
       try {
         // v1.0.1 of the SDK dropped the top-level `protocolVersion` field
         // and moved it onto each AgentInterface inside `supportedInterfaces`.
-        // The migration requires "1.0" on every interface. We also assert
-        // the top-level field is absent so a future regression to the v0.3
-        // shape is caught.
+        // The fang card declares both v1.0 interfaces (HTTP+JSON REST +
+        // JSONRPC) and one v0.3 interface (the legacyCompat entry the SDK
+        // uses to derive a v0.3-shaped card for A2A-Version: 0.3 clients).
         const card = booted.agentCard as Record<string, unknown>;
         expect(card.protocolVersion).toBeUndefined();
         expect(Array.isArray(booted.agentCard.supportedInterfaces)).toBe(true);
-        expect(booted.agentCard.supportedInterfaces.length).toBeGreaterThan(0);
-        for (const i of booted.agentCard.supportedInterfaces) {
-          expect(i.protocolVersion).toBe('1.0');
+        const ifaces = booted.agentCard.supportedInterfaces;
+        expect(ifaces.length).toBeGreaterThanOrEqual(2);
+
+        // Every v1.0 interface MUST declare protocolVersion '1.0'.
+        const v1Ifaces = ifaces.filter((i) => i.protocolVersion === '1.0');
+        expect(v1Ifaces.length).toBeGreaterThan(0);
+        for (const i of v1Ifaces) {
+          // protocolBinding is also part of v1.0 AgentInterface and must
+          // be one of the SDK-supported values.
+          expect(['HTTP+JSON', 'JSONRPC', 'GRPC']).toContain(i.protocolBinding);
+          expect(i.url).toMatch(/^https?:\/\//);
         }
+
+        // At least one v0.3 interface MUST exist so legacyCompat can
+        // synthesize a v0.3 card via toCompatAgentCard.
+        const v03Ifaces = ifaces.filter((i) => i.protocolVersion === '0.3');
+        expect(v03Ifaces.length).toBeGreaterThan(0);
       } finally {
         await booted.close();
       }
     });
 
-    it('serves protocolVersion "1.0" on the wire via /.well-known/agent-card.json', async () => {
+    it('serves the full supportedInterfaces list on the wire via /.well-known/agent-card.json', async () => {
       const booted = await boot();
       try {
-        // Send A2A-Version: 1.0 to bypass the legacyCompat router, which
-        // tries to convert the card to v0.3 shape and fails because every
-        // supportedInterface here declares v1.0 (no v0.3 fallback exists).
-        // With the v1.0 header the legacy router falls through to the
-        // canonical v1.0 card handler and returns 200.
+        // Send A2A-Version: 1.0 so the canonical v1.0 card handler runs
+        // (the legacy router would otherwise rewrite the card to v0.3
+        // shape and place the primary interface's protocolVersion at
+        // the top level). The v1.0 card does NOT expose a top-level
+        // protocolVersion — it lives only on each supportedInterface.
         const r = await fetch(`${booted.url}/.well-known/agent-card.json`, {
           headers: { 'A2A-Version': '1.0' },
         });
         expect(r.status).toBe(200);
         const card = (await r.json()) as {
           protocolVersion?: string;
-          supportedInterfaces?: Array<{ protocolBinding?: string; protocolVersion?: string }>;
+          supportedInterfaces?: Array<{ protocolBinding?: string; protocolVersion?: string; url?: string }>;
         };
-        // v1.0 wire shape: top-level `protocolVersion` MUST NOT appear, and
-        // every supportedInterfaces[*] MUST advertise protocolVersion '1.0'.
+        // v1.0 wire shape: top-level `protocolVersion` MUST NOT appear.
         expect(card.protocolVersion).toBeUndefined();
         expect(Array.isArray(card.supportedInterfaces)).toBe(true);
-        expect(card.supportedInterfaces!.length).toBeGreaterThan(0);
-        for (const i of card.supportedInterfaces!) {
-          expect(i.protocolVersion).toBe('1.0');
-        }
+        expect(card.supportedInterfaces!.length).toBeGreaterThanOrEqual(2);
+
+        // Both v1.0 and v0.3 interfaces must be present in the v1.0
+        // card's `supportedInterfaces` list. The legacyCompat handler
+        // (when invoked) embeds both via embedV1Interfaces; the canonical
+        // v1.0 handler returns the raw core card with both already in.
+        const versions = card.supportedInterfaces!.map((i) => i.protocolVersion);
+        expect(versions).toContain('1.0');
+        expect(versions).toContain('0.3');
       } finally {
         await booted.close();
       }
