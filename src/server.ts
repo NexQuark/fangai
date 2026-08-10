@@ -235,7 +235,16 @@ export class BridgeExecutor implements AgentExecutor {
               settled = true;
               clearTimeout(timer);
               this.forgetTrackedTask(taskId);
-              this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || 'Done'));
+              // Terminal statusUpdate (not 'message' event) — SDK stream
+              // pattern rejects 'message' after the initial 'task' event.
+              this.pub(bus, 'statusUpdate', {
+                taskId, contextId,
+                status: {
+                  state: TaskState.TASK_STATE_COMPLETED,
+                  message: agentMessage(contextId, taskId, accumulated || 'Done'),
+                  timestamp: new Date().toISOString(),
+                },
+              });
               bus.finished();
               resolve();
             }
@@ -268,10 +277,24 @@ export class BridgeExecutor implements AgentExecutor {
           settled = true;
           if (code === 0) {
             this.forgetTrackedTask(taskId);
-            this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || '(no output)'));
+            this.pub(bus, 'statusUpdate', {
+              taskId, contextId,
+              status: {
+                state: TaskState.TASK_STATE_COMPLETED,
+                message: agentMessage(contextId, taskId, accumulated || '(no output)'),
+                timestamp: new Date().toISOString(),
+              },
+            });
           } else {
             this.forgetTrackedTask(taskId);
-            this.pub(bus, 'message', agentMessage(contextId, taskId, `Error: exit code ${code}`));
+            this.pub(bus, 'statusUpdate', {
+              taskId, contextId,
+              status: {
+                state: TaskState.TASK_STATE_FAILED,
+                message: agentMessage(contextId, taskId, `Error: exit code ${code}`),
+                timestamp: new Date().toISOString(),
+              },
+            });
           }
           bus.finished();
           resolve();
@@ -385,9 +408,18 @@ export class BridgeExecutor implements AgentExecutor {
         if (ev.type === 'status' && ev.state === 'completed') {
           settled = true;
           clearTimeout(timer);
-          // Publish final message for sync clients
+          // Publish terminal statusUpdate (not 'message' event) — the
+          // SDK's stream pattern state machine rejects 'message' after
+          // the initial 'task' event. See executeOneshot for rationale.
           this.forgetTrackedTask(taskId);
-          this.pub(bus, 'message', agentMessage(contextId, taskId, accumulated || 'Done'));
+          this.pub(bus, 'statusUpdate', {
+            taskId, contextId,
+            status: {
+              state: TaskState.TASK_STATE_COMPLETED,
+              message: agentMessage(contextId, taskId, accumulated || 'Done'),
+              timestamp: new Date().toISOString(),
+            },
+          });
           bus.finished();
           // Clean up handler after completion
           this.persistent!.removeLineHandler(taskId);

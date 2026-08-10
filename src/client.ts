@@ -63,9 +63,20 @@ export class FangClient {
       const data = await res.json() as any;
       if (data?.error) return { taskId: '', status: 'failed', error: data.error.message };
       const result = data?.result;
+      // v0.3 message response (legacy SDK compat for non-streaming clients)
       if (result?.kind === 'message') {
         const text = result.parts?.map((p: any) => p.text).join('') || '';
         return { taskId: '', status: 'completed', text };
+      }
+      // v1.0 task response: terminal statusUpdate carries the LLM reply
+      // in status.message. Extract from there.
+      if (result?.kind === 'task' && result.status) {
+        const status = result.status;
+        if (status.message?.parts) {
+          const text = status.message.parts.map((p: any) => p.text).join('') || '';
+          return { taskId: result.id || '', status: status.state || 'completed', text };
+        }
+        return { taskId: result.id || '', status: status.state || 'submitted' };
       }
       return { taskId: result?.id || '', status: result?.status?.state || 'submitted' };
     }
@@ -150,8 +161,17 @@ export class FangClient {
         finished = true;
       }
 
-      // Handle status-update with final flag
+      // Handle status-update with final flag. The terminal statusUpdate
+      // carries the LLM reply in status.message.parts (text), or
+      // status.message.text (fallback for some wire shapes).
       if (result?.kind === 'status-update' && result?.final) {
+        const finalMsg = result.status?.message;
+        if (finalMsg) {
+          const msgText = finalMsg.parts?.map((p: any) => p.text).join('')
+            || finalMsg.text
+            || '';
+          if (msgText) finalText = msgText;
+        }
         finished = true;
       }
     };
