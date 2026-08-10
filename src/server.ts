@@ -66,6 +66,32 @@ function agentMessage(contextId: string, taskId: string, text: string): {
   };
 }
 
+/**
+ * Complete v1.0 agent Artifact. The legacyCompat translator's
+ * toCompatArtifact() reads `extensions.length` and `metadata` via
+ * nonEmptyArray2(), so omitting extensions (or metadata) makes the
+ * response conversion throw on undefined — breaking streaming
+ * JSON-RPC at the first artifactUpdate. Always publish fully-formed
+ * artifacts. Same pattern as agentMessage() above.
+ */
+function agentArtifact(artifactId: string, name: string, parts: ReturnType<typeof textPart>[]): {
+  artifactId: string;
+  name: string;
+  description: string;
+  parts: ReturnType<typeof textPart>[];
+  metadata: Record<string, never>;
+  extensions: never[];
+} {
+  return {
+    artifactId,
+    name,
+    description: '',
+    parts,
+    metadata: {},
+    extensions: [],
+  };
+}
+
 // ─── BridgeExecutor ────────────────────────────────────────────────────────
 
 export class BridgeExecutor implements AgentExecutor {
@@ -201,7 +227,7 @@ export class BridgeExecutor implements AgentExecutor {
               accumulated += ev.text;
               this.pub(bus, 'artifactUpdate', {
                 taskId, contextId,
-                artifact: { artifactId: 'stdout', name: 'output', parts: [textPart(ev.text)] },
+                artifact: agentArtifact('stdout', 'output', [textPart(ev.text)]),
                 append: true, lastChunk: false,
               });
             }
@@ -233,7 +259,7 @@ export class BridgeExecutor implements AgentExecutor {
         onError: (text) => {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: { artifactId: 'stderr', name: 'errors', parts: [textPart(text)] },
+            artifact: agentArtifact('stderr', 'errors', [textPart(text)]),
           });
         },
         onExit: (code) => {
@@ -311,33 +337,25 @@ export class BridgeExecutor implements AgentExecutor {
           accumulated += ev.text;
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: ev.type === 'thinking' ? 'pi-thinking' : 'stdout',
-              name: ev.type === 'thinking' ? 'thinking' : 'output',
-              parts: [textPart(ev.text)],
-            },
+            artifact: agentArtifact(
+              ev.type === 'thinking' ? 'pi-thinking' : 'stdout',
+              ev.type === 'thinking' ? 'thinking' : 'output',
+              [textPart(ev.text)]
+            ),
             append: true, lastChunk: false,
           });
         }
         if (ev.type === 'tool-call') {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: 'pi-agent-tool-call',
-              name: 'tool-call',
-              parts: [textPart(`[${ev.tool}] ${JSON.stringify(ev.input ?? {})}`)],
-            },
+            artifact: agentArtifact('pi-agent-tool-call', 'tool-call', [textPart(`[${ev.tool}] ${JSON.stringify(ev.input ?? {})}`)]),
             append: true, lastChunk: false,
           });
         }
         if (ev.type === 'tool-result') {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: 'pi-agent-tool-result',
-              name: 'tool-result',
-              parts: [textPart(`${ev.tool}: ${ev.output}`)],
-            },
+            artifact: agentArtifact('pi-agent-tool-result', 'tool-result', [textPart(`${ev.tool}: ${ev.output}`)]),
             append: true, lastChunk: false,
           });
         }
@@ -345,11 +363,7 @@ export class BridgeExecutor implements AgentExecutor {
           const detail = ev.detail ? ` ${JSON.stringify(ev.detail)}` : '';
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: `pi-protocol-${ev.subtype}`,
-              name: `pi-protocol/${ev.subtype}`,
-              parts: [textPart(`[pi] ${ev.subtype}${detail}`)],
-            },
+            artifact: agentArtifact(`pi-protocol-${ev.subtype}`, `pi-protocol/${ev.subtype}`, [textPart(`[pi] ${ev.subtype}${detail}`)]),
             append: true,
             lastChunk: false,
           });
@@ -357,22 +371,14 @@ export class BridgeExecutor implements AgentExecutor {
         if (ev.type === 'host-tool-request') {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: 'pi-host-tool-request',
-              name: `host-tool/${ev.tool}`,
-              parts: [textPart(`[host_tool_call id=${ev.requestId}] ${ev.tool} ${JSON.stringify(ev.input)}`)],
-            },
+            artifact: agentArtifact('pi-host-tool-request', `host-tool/${ev.tool}`, [textPart(`[host_tool_call id=${ev.requestId}] ${ev.tool} ${JSON.stringify(ev.input)}`)]),
             append: true, lastChunk: false,
           });
         }
         if (ev.type === 'host-tool-cancel') {
           this.pub(bus, 'artifactUpdate', {
             taskId, contextId,
-            artifact: {
-              artifactId: 'pi-host-tool-cancel',
-              name: 'host-tool-cancel',
-              parts: [textPart(`[host_tool_cancel] cancelId=${ev.cancelId} target=${ev.targetRequestId}`)],
-            },
+            artifact: agentArtifact('pi-host-tool-cancel', 'host-tool-cancel', [textPart(`[host_tool_cancel] cancelId=${ev.cancelId} target=${ev.targetRequestId}`)]),
             append: true, lastChunk: false,
           });
         }
